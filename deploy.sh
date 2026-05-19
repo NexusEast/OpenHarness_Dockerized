@@ -7,10 +7,148 @@
 #   ./deploy.sh --name oh-default     # non-interactive (reuses saved settings if any)
 #   ./deploy.sh --extra-mount /data   # add extra bind mounts (repeatable)
 #   ./deploy.sh --rebuild-image       # force rebuild of the image
+#   ./deploy.sh --no-self-update      # skip the wrapper-repo self-update check
 #
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/scripts/lib/common.sh"
+
+# ---------------- self-update check (wrapper repo) ----------------
+# Save the original argv so we can re-exec ourselves with the same call after a
+# pull. Strip out --no-self-update so users don't have to repeat it; honor the
+# OH_DEPLOYER_NO_SELF_UPDATE env var as an alternative way to disable.
+ORIG_ARGV=("$@")
+NO_SELF_UPDATE=0
+if [ "${OH_DEPLOYER_NO_SELF_UPDATE:-0}" = "1" ]; then NO_SELF_UPDATE=1; fi
+filtered=()
+for a in "$@"; do
+    case "$a" in
+        --no-self-update) NO_SELF_UPDATE=1 ;;
+        *) filtered+=("$a") ;;
+    esac
+done
+# Reset $@ so the rest of the script sees argv without --no-self-update.
+set -- ${filtered[@]+"${filtered[@]}"}
+
+ohd_self_update_check() {
+    # Guard against infinite re-exec loops.
+    [ "${OH_DEPLOYER_SELF_UPDATE_DONE:-0}" = "1" ] && return 0
+    [ "$NO_SELF_UPDATE" -eq 1 ] && return 0
+
+    # Helper: the self-update was skipped for some reason; ask the user whether
+    # to continue running deploy anyway, or abort. Non-interactive shells
+    # auto-continue (so CI / piped invocations don't hang).
+    _ohd_self_update_skip() {
+        local level="$1"     # "info" | "warn"
+        local reason="$2"
+        local hint="${3:-}"
+        case "$level" in
+            warn) warn "$reason" ;;
+            *)    info "$reason" ;;
+        esac
+        [ -n "$hint" ] && info "$hint"
+        if [ -t 0 ] && [ -t 1 ]; then
+            local ans=""
+            printf "? Continue deploy without self-update? [Y/n] "
+            read -r ans || ans=""
+            case "${ans:-Y}" in
+                n|N|no|NO)
+                    err "Aborted by user."
+                    exit 1 ;;
+            esac
+        else
+            info "Non-interactive shell; continuing without self-update."
+        fi
+        return 0
+    }
+
+    if ! command -v git >/dev/null 2>&1; then
+        _ohd_self_update_skip info "git not found; cannot self-update the wrapper repo."
+        return 0
+    fi
+    if [ ! -d "$HERE/.git" ]; then
+        _ohd_self_update_skip info "Not a git checkout; cannot self-update the wrapper repo."
+        return 0
+    fi
+
+    local branch
+    branch="$(git -C "$HERE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    if [ "$branch" = "HEAD" ]; then
+        _ohd_self_update_skip info "Detached HEAD; cannot self-update."
+        return 0
+    fi
+
+    # Skip on dirty tree (warn). Don't auto-stash; user data safety > convenience.
+    if ! git -C "$HERE" diff --quiet || ! git -C "$HERE" diff --cached --quiet; then
+        _ohd_self_update_skip warn \
+            "Wrapper repo has uncommitted changes; cannot self-update." \
+            "Run './update-deployer.sh' manually after committing/stashing."
+        return 0
+    fi
+
+    info "Checking wrapper repo for updates (origin/$branch)..."
+    if ! git -C "$HERE" fetch --quiet --prune origin 2>/dev/null; then
+        _ohd_self_update_skip info "git fetch failed (offline?); cannot self-update."
+        return 0
+    fi
+
+    local local_sha remote_sha base
+    local_sha="$(git -C "$HERE" rev-parse HEAD)"
+    remote_sha="$(git -C "$HERE" rev-parse "origin/$branch" 2>/dev/null || echo "$local_sha")"
+    if [ "$local_sha" = "$remote_sha" ]; then
+        ok "Wrapper repo is up to date."
+        return 0
+    fi
+    base="$(git -C "$HERE" merge-base HEAD "origin/$branch" 2>/dev/null || echo "")"
+    if [ -n "$base" ] && [ "$base" != "$local_sha" ]; then
+        # Local has commits remote doesn't -> non-fast-forward; treat as skip.
+        _ohd_self_update_skip warn \
+            "Local branch has commits not on origin/$branch; cannot fast-forward." \
+            "Run './update-deployer.sh --rebase' manually if you want to integrate."
+        return 0
+    fi
+
+    local n_behind
+    n_behind="$(git -C "$HERE" rev-list --count "HEAD..origin/$branch" 2>/dev/null || echo "?")"
+    echo
+    info "Wrapper repo is $n_behind commit(s) behind origin/$branch."
+    info "Recent upstream commits:"
+    git -C "$HERE" log --oneline --no-decorate "HEAD..origin/$branch" | head -n 10 | sed 's/^/    /'
+    echo
+
+    local ans=""
+    if [ -t 0 ] && [ -t 1 ]; then
+        printf "? Pull latest wrapper code and restart deploy? [Y/n] "
+        read -r ans || ans=""
+    else
+        info "Non-interactive shell; auto-accepting self-update."
+        ans="y"
+    fi
+    case "${ans:-Y}" in
+        n|N|no|NO)
+            _ohd_self_update_skip warn "Self-update declined by user."
+            return 0 ;;
+    esac
+
+    info "Pulling..."
+    if ! git -C "$HERE" pull --ff-only --quiet origin "$branch"; then
+        _ohd_self_update_skip warn \
+            "git pull --ff-only failed." \
+            "Run './update-deployer.sh' manually to investigate."
+        return 0
+    fi
+    # Re-apply +x on shell scripts (Windows checkouts often drop it).
+    if command -v chmod >/dev/null 2>&1; then
+        while IFS= read -r f; do
+            [ -f "$HERE/$f" ] && chmod +x "$HERE/$f" 2>/dev/null || true
+        done < <(git -C "$HERE" ls-files '*.sh')
+    fi
+    ok "Wrapper repo updated to $(git -C "$HERE" rev-parse --short HEAD). Restarting deploy..."
+    echo
+    export OH_DEPLOYER_SELF_UPDATE_DONE=1
+    exec "$HERE/deploy.sh" ${ORIG_ARGV[@]+"${ORIG_ARGV[@]}"}
+}
+ohd_self_update_check
 
 ohd_require_supported_platform
 ohd_require_jq
@@ -55,6 +193,8 @@ Options:
   --set-default            Force this instance as the default
   --no-default             Don't make this the default
   --yes / -y               Non-interactive: accept reasonable defaults
+  --no-self-update         Skip the wrapper-repo self-update check
+                           (also: env OH_DEPLOYER_NO_SELF_UPDATE=1)
   -h / --help              This help
 EOF
             exit 0 ;;

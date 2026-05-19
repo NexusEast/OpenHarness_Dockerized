@@ -4,6 +4,7 @@
 #     .\deploy.ps1
 #     .\deploy.ps1 -Name oh-default -Yes
 #     .\deploy.ps1 -ExtraMount D:\Projects -RebuildImage
+#     .\deploy.ps1 -NoSelfUpdate                # skip the wrapper-repo self-update check
 [CmdletBinding()]
 param(
     [string]$Name,
@@ -15,11 +16,165 @@ param(
     [switch]$RebuildImage,
     [switch]$Yes,
     [switch]$SetDefault,
-    [switch]$NoDefault
+    [switch]$NoDefault,
+    [switch]$NoSelfUpdate
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot/scripts/lib/Common.psm1" -Force -DisableNameChecking
+
+# ---------------- self-update check (wrapper repo) ----------------
+# Re-exec ourselves after a successful pull. Guard against infinite loops with
+# the OH_DEPLOYER_SELF_UPDATE_DONE env var. Honor both -NoSelfUpdate and the
+# OH_DEPLOYER_NO_SELF_UPDATE env var as escape hatches.
+function Invoke-OhdSelfUpdateCheck {
+    if ($env:OH_DEPLOYER_SELF_UPDATE_DONE -eq '1') { return }
+    if ($NoSelfUpdate) { return }
+    if ($env:OH_DEPLOYER_NO_SELF_UPDATE -eq '1') { return }
+
+    # Helper: the self-update was skipped for some reason; ask the user whether
+    # to continue running deploy anyway, or abort. Non-interactive shells
+    # auto-continue (so CI / piped invocations don't hang).
+    function Confirm-OhdContinueWithoutSelfUpdate {
+        param(
+            [ValidateSet('info','warn')] [string]$Level,
+            [string]$Reason,
+            [string]$Hint = ''
+        )
+        if ($Level -eq 'warn') { Write-OhdWarn $Reason } else { Write-OhdInfo $Reason }
+        if ($Hint) { Write-OhdInfo $Hint }
+        if ([Environment]::UserInteractive -and $Host.UI.RawUI) {
+            $ans = Read-Host -Prompt '? Continue deploy without self-update? [Y/n]'
+            if ([string]::IsNullOrWhiteSpace($ans)) { $ans = 'Y' }
+            if ($ans -match '^[nN]') {
+                Write-OhdErr 'Aborted by user.'
+                exit 1
+            }
+        } else {
+            Write-OhdInfo 'Non-interactive shell; continuing without self-update.'
+        }
+    }
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level info `
+            -Reason 'git not found; cannot self-update the wrapper repo.'
+        return
+    }
+    if (-not (Test-Path (Join-Path $PSScriptRoot '.git'))) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level info `
+            -Reason 'Not a git checkout; cannot self-update the wrapper repo.'
+        return
+    }
+
+    $branch = (& git -C $PSScriptRoot rev-parse --abbrev-ref HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level info `
+            -Reason 'git rev-parse failed; cannot self-update.'
+        return
+    }
+    $branch = $branch.Trim()
+    if ($branch -eq 'HEAD') {
+        Confirm-OhdContinueWithoutSelfUpdate -Level info `
+            -Reason 'Detached HEAD; cannot self-update.'
+        return
+    }
+
+    & git -C $PSScriptRoot diff --quiet
+    $dirty1 = $LASTEXITCODE
+    & git -C $PSScriptRoot diff --cached --quiet
+    $dirty2 = $LASTEXITCODE
+    if ($dirty1 -ne 0 -or $dirty2 -ne 0) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level warn `
+            -Reason 'Wrapper repo has uncommitted changes; cannot self-update.' `
+            -Hint   "Run .\update-deployer.ps1 manually after committing/stashing."
+        return
+    }
+
+    Write-OhdInfo "Checking wrapper repo for updates (origin/$branch)..."
+    & git -C $PSScriptRoot fetch --quiet --prune origin 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level info `
+            -Reason 'git fetch failed (offline?); cannot self-update.'
+        return
+    }
+
+    $local  = (& git -C $PSScriptRoot rev-parse HEAD).Trim()
+    $remote = (& git -C $PSScriptRoot rev-parse "origin/$branch" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level info `
+            -Reason "origin/$branch is missing; cannot self-update."
+        return
+    }
+    $remote = $remote.Trim()
+    if ($local -eq $remote) {
+        Write-OhdOk 'Wrapper repo is up to date.'
+        return
+    }
+    $base = (& git -C $PSScriptRoot merge-base HEAD "origin/$branch" 2>$null)
+    if ($LASTEXITCODE -eq 0) { $base = $base.Trim() } else { $base = '' }
+    if ($base -and $base -ne $local) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level warn `
+            -Reason "Local branch has commits not on origin/$branch; cannot fast-forward." `
+            -Hint   "Run .\update-deployer.ps1 -Rebase manually if you want to integrate."
+        return
+    }
+
+    $behind = (& git -C $PSScriptRoot rev-list --count "HEAD..origin/$branch" 2>$null).Trim()
+    Write-Host ''
+    Write-OhdInfo "Wrapper repo is $behind commit(s) behind origin/$branch."
+    Write-OhdInfo 'Recent upstream commits:'
+    & git -C $PSScriptRoot log --oneline --no-decorate "HEAD..origin/$branch" |
+        Select-Object -First 10 |
+        ForEach-Object { Write-Host "    $_" }
+    Write-Host ''
+
+    $ans = 'Y'
+    if ([Environment]::UserInteractive -and $Host.UI.RawUI) {
+        $ans = Read-Host -Prompt '? Pull latest wrapper code and restart deploy? [Y/n]'
+        if ([string]::IsNullOrWhiteSpace($ans)) { $ans = 'Y' }
+    } else {
+        Write-OhdInfo 'Non-interactive shell; auto-accepting self-update.'
+    }
+    if ($ans -match '^[nN]') {
+        Confirm-OhdContinueWithoutSelfUpdate -Level warn `
+            -Reason 'Self-update declined by user.'
+        return
+    }
+
+    Write-OhdInfo 'Pulling...'
+    & git -C $PSScriptRoot pull --ff-only --quiet origin $branch
+    if ($LASTEXITCODE -ne 0) {
+        Confirm-OhdContinueWithoutSelfUpdate -Level warn `
+            -Reason 'git pull --ff-only failed.' `
+            -Hint   "Run .\update-deployer.ps1 manually to investigate."
+        return
+    }
+    $short = (& git -C $PSScriptRoot rev-parse --short HEAD).Trim()
+    Write-OhdOk "Wrapper repo updated to $short. Restarting deploy..."
+    Write-Host ''
+
+    # Rebuild original argv (without -NoSelfUpdate, which we'd strip; the env var
+    # OH_DEPLOYER_SELF_UPDATE_DONE prevents infinite re-exec).
+    $env:OH_DEPLOYER_SELF_UPDATE_DONE = '1'
+    $reArgs = @()
+    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        if ($kv.Key -eq 'NoSelfUpdate') { continue }
+        $val = $kv.Value
+        if ($val -is [System.Management.Automation.SwitchParameter]) {
+            if ($val.IsPresent) { $reArgs += "-$($kv.Key)" }
+        } elseif ($val -is [System.Array]) {
+            foreach ($v in $val) { $reArgs += @("-$($kv.Key)", "$v") }
+        } else {
+            $reArgs += @("-$($kv.Key)", "$val")
+        }
+    }
+    $pwshExe = Get-Command pwsh -ErrorAction SilentlyContinue
+    if (-not $pwshExe) { $pwshExe = Get-Command powershell -ErrorAction SilentlyContinue }
+    if (-not $pwshExe) { Stop-OhdDie 'Cannot locate pwsh or powershell to re-exec deploy.' }
+    & $pwshExe.Source -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'deploy.ps1') @reArgs
+    exit $LASTEXITCODE
+}
+Invoke-OhdSelfUpdateCheck
 
 if (-not (Test-OhdSupportedHost)) { Stop-OhdDie "Unsupported host." }
 Assert-OhdDocker
