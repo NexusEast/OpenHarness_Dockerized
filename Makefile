@@ -16,8 +16,11 @@ status: ## Show container status
 restart: ## Restart default instance
 	./restart.sh
 
-update: ## Rebuild image and recreate containers
-	./update.sh
+update-oh: ## Rebuild OH image and recreate containers
+	./update-oh.sh
+
+update-deployer: ## Update this wrapper repo (git pull --ff-only)
+	./update-deployer.sh
 
 uninstall: ## Remove containers and shims (keep user data)
 	./uninstall.sh
@@ -31,4 +34,4 @@ build: ## Build the docker image only
 	  --build-arg HOST_USER=$$(id -un) --build-arg HOST_HOME=$$HOME \
 	  ./docker
 
-.PHONY: help deploy list status restart update uninstall shims build
+.PHONY: help deploy list status restart update-oh update-deployer uninstall shims build

@@ -269,7 +269,7 @@ oh config set default_model "$OH_DEFAULT_MODEL" 2>/dev/null || true
     # Persist the OpenRouter API key:
     #  (1) inside the container at /etc/oh-runtime/secrets.env so the entrypoint
     #      can source it before every command (no need to pass -e on each call).
-    #  (2) on the host at <per-instance>/runtime-secrets.env (0600) so update.ps1
+    #  (2) on the host at <per-instance>/runtime-secrets.env (0600) so update-oh.ps1
     #      can re-inject it after a container recreate.  This file lives under
     #      the per-instance dir; it is never bind-mounted into any container,
     #      and goes away with `oh-ctl rm <name> --purge`.

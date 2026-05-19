@@ -32,7 +32,9 @@ built fresh from `pip install openharness-ai`.
   credentials and memory survive container recreations and are shared with
   any future native install.
 - **No vendored OH source.** The `Dockerfile` does `pip install openharness-ai`
-  at build time. Upgrade by re-running `update.sh` / `update.ps1`.
+  at build time. Upgrade by re-running `update-oh.sh` / `update-oh.ps1`.
+  To update the wrapper repo itself (this very tree), use
+  `update-deployer.sh` / `update-deployer.ps1`.
 - **OpenRouter wizard.** `deploy.sh` / `deploy.ps1` asks for your OpenRouter
   API key + default model and writes the provider profile inside the
   container for you.
@@ -108,11 +110,12 @@ After deploy, the shims are installed to:
 
 | *nix              | PowerShell        | Purpose                                                |
 | ----------------- | ----------------- | ------------------------------------------------------ |
-| `deploy.sh`       | `deploy.ps1`      | Deploy a new instance, or redeploy an existing one     |
-| `status.sh`       | `status.ps1`      | Alias for `oh-ctl status`                              |
-| `restart.sh`      | `restart.ps1`     | Alias for `oh-ctl restart`                             |
-| `update.sh`       | `update.ps1`      | Rebuild the image and recreate containers              |
-| `uninstall.sh`    | `uninstall.ps1`   | Remove containers and shims (keeps your user data)     |
+| `deploy.sh`         | `deploy.ps1`         | Deploy a new instance, or redeploy an existing one     |
+| `status.sh`         | `status.ps1`         | Alias for `oh-ctl status`                              |
+| `restart.sh`        | `restart.ps1`        | Alias for `oh-ctl restart`                             |
+| `update-oh.sh`      | `update-oh.ps1`      | Rebuild the OH runtime image and recreate containers   |
+| `update-deployer.sh`| `update-deployer.ps1`| Update this wrapper repo itself (`git pull --ff-only`) |
+| `uninstall.sh`      | `uninstall.ps1`      | Remove containers and shims (keeps your user data)     |
 
 ## How file mounting works
 
@@ -145,8 +148,10 @@ In other words:
   the Dockerfile, or your `~/.openharness-docker` state. It would see
   empty directories there and any writes would land in throwaway
   in-memory storage.
-- Upgrading OpenHarness only happens when you explicitly run `update.sh`
-  / `update.ps1` (which rebuilds the image from `pip install`).
+- Upgrading OpenHarness only happens when you explicitly run `update-oh.sh`
+  / `update-oh.ps1` (which rebuilds the image from `pip install`).
+  Updating this wrapper repo itself is a separate command:
+  `update-deployer.sh` / `update-deployer.ps1`.
 
 ### Per-instance state isolation
 

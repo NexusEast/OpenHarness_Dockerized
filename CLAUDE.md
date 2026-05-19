@@ -23,7 +23,7 @@ Supported hosts: macOS, Linux, WSL, Windows PowerShell.
 
 ```
 deploy.sh / deploy.ps1         interactive wizard (multi-instance aware)
-status.sh|.ps1, restart.sh|.ps1, update.sh|.ps1, uninstall.sh|.ps1
+status.sh|.ps1, restart.sh|.ps1, update-oh.sh|.ps1, update-deployer.sh|.ps1, uninstall.sh|.ps1
 setup-permissions.sh           chmod +x for everything (Windows clone helper)
 Makefile                       *nix convenience targets
 

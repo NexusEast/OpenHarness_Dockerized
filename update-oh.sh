@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# update.sh - pull/rebuild the latest openharness-ai image and recreate containers.
+# update-oh.sh - pull/rebuild the latest openharness-ai image and recreate containers.
+#
+# This updates the OpenHarness runtime inside the container by reinstalling
+# 'openharness-ai' from PyPI. It does NOT touch this wrapper repo - run
+# update-deployer.sh for that.
 #
 # Usage:
-#   ./update.sh                   # rebuild image, recreate every instance
-#   ./update.sh --name oh-default # only update one instance
-#   ./update.sh --version 0.1.9   # pin a specific openharness-ai version
+#   ./update-oh.sh                   # rebuild image, recreate every instance
+#   ./update-oh.sh --name oh-default # only update one instance
+#   ./update-oh.sh --version 0.1.9   # pin a specific openharness-ai version
 #
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -22,7 +26,7 @@ while [ $# -gt 0 ]; do
         --name)    ONLY="$2"; shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: update.sh [--name NAME] [--version VER]"; exit 0 ;;
+            echo "Usage: update-oh.sh [--name NAME] [--version VER]"; exit 0 ;;
         *) die "Unknown arg: $1" ;;
     esac
 done

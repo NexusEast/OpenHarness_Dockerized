@@ -314,7 +314,7 @@ CFG_EOF
     #  (1) inside the container at /etc/oh-runtime/secrets.env (root-owned 0600)
     #      so the entrypoint can source it for every `docker exec` call.
     #  (2) on the host at $PER_INSTANCE_ROOT_HOST/runtime-secrets.env (0600)
-    #      so update.sh can re-inject it after a container recreate. This file
+    #      so update-oh.sh can re-inject it after a container recreate. This file
     #      stays under per-instance dir, never bind-mounted into the container,
     #      and goes away when you `oh-ctl rm <name> --purge`.
     docker exec -i -u 0:0 "$CONTAINER_NAME" bash -c '
@@ -334,7 +334,7 @@ CFG_EOF
 fi
 
 # ---------------- 7. persist instance metadata ----------------
-# Serialize shadow paths so update.sh can reapply them on container recreation.
+# Serialize shadow paths so update-oh.sh can reapply them on container recreation.
 shadow_paths_csv=""
 for p in "${SHADOW_PATHS[@]}"; do
     [ -n "$shadow_paths_csv" ] && shadow_paths_csv+=":"

@@ -83,7 +83,7 @@ OH credentials live under `~/.openharness/` (shared between host and container),
 ### F. No OpenHarness source in this repo
 
 `docker/Dockerfile` only runs `pip install openharness-ai`. The total source of this repo is under 1500 lines of Bash/PowerShell plus a single Dockerfile.
-To upgrade OH, run `./update.sh` or `.\update.ps1` to rebuild the image - there is no source-sync burden.
+To upgrade OH, run `./update-oh.sh` or `.\update-oh.ps1` to rebuild the image. To update this wrapper repo itself (deploy/shim/Dockerfile/scripts), run `./update-deployer.sh` or `.\update-deployer.ps1` (it is a thin `git pull --ff-only` wrapper that also reports which follow-up command, if any, you should run next).
 
 ## Directory layout
 
@@ -93,7 +93,8 @@ To upgrade OH, run `./update.sh` or `.\update.ps1` to rebuild the image - there 
 ├── deploy.sh            # deployment wizard
 ├── status.sh            # = oh-ctl status
 ├── restart.sh           # = oh-ctl restart
-├── update.sh            # upgrade image + rebuild container
+├── update-oh.sh         # upgrade OH image + rebuild containers
+├── update-deployer.sh   # update THIS wrapper repo (git pull --ff-only)
 ├── uninstall.sh         # uninstall (user data is preserved)
 ├── setup-permissions.sh # one-shot chmod +x
 ├── Makefile
@@ -133,8 +134,9 @@ The container itself is stateless. All persistent data lives on the host:
 
 | Need                        | Command                                       |
 | --------------------------- | --------------------------------------------- |
-| Upgrade OH to latest        | `./update.sh`                                 |
-| Upgrade to a specific ver.  | `./update.sh --version 0.1.9`                 |
+| Upgrade OH to latest        | `./update-oh.sh`                              |
+| Upgrade to a specific ver.  | `./update-oh.sh --version 0.1.9`              |
+| Update this wrapper repo    | `./update-deployer.sh`                        |
 | Add a second instance       | `./deploy.sh --name oh-work`                  |
 | Switch default instance     | `oh-ctl set-default oh-work`                  |
 | Tail the default logs       | `oh-ctl logs -f`                              |
