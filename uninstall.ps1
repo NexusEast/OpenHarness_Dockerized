@@ -1,21 +1,31 @@
 [CmdletBinding()]
 param(
     [switch]$Image,
+    [switch]$Volumes,
     [switch]$PurgeConfig,
     [switch]$All
 )
 $ErrorActionPreference = 'Stop'
 Import-Module "$PSScriptRoot/scripts/lib/Common.psm1" -Force -DisableNameChecking
-if ($All) { $Image = $true; $PurgeConfig = $true }
+if ($All) { $Image = $true; $Volumes = $true; $PurgeConfig = $true }
 Assert-OhdDocker
 
-$labelFilter = "label=$((Get-OhdPaths).Label)"
+$labelFilter = "label=$script:OhdLabel"
 $ctns = @(docker ps -aq --filter $labelFilter)
 if ($ctns.Count -gt 0) {
     Write-OhdInfo "Removing $($ctns.Count) OH container(s)..."
     docker rm -f @ctns *> $null
     Write-OhdOk "Containers removed."
 } else { Write-OhdInfo "No OH containers found." }
+
+if ($Volumes) {
+    $vols = @(docker volume ls -q | Where-Object { $_ -match '^oh-.*-home$' })
+    if ($vols.Count -gt 0) {
+        Write-OhdInfo "Removing $($vols.Count) OH home volume(s)..."
+        docker volume rm @vols *> $null
+        Write-OhdOk "Home volumes removed (per-instance OpenHarness state is gone)."
+    }
+}
 
 if ($Image) {
     $imgs = @(docker images -q openharness-dockerized 2>$null | Sort-Object -Unique)
@@ -26,17 +36,16 @@ if ($Image) {
     }
 }
 
-# Shims (both .ps1 and .cmd, plus the *nix-style ones if present)
-$bin = (Get-OhdPaths).ShimBinDir
+# Shims.
+$bin = $script:OhdShimBinDir
 foreach ($f in 'openh.ps1','openh.cmd','ohmo.ps1','ohmo.cmd','openharness.ps1','openharness.cmd','oh-ctl.ps1','oh-ctl.cmd','oh','ohmo','openh','openharness','oh-ctl') {
     $p = Join-Path $bin $f
     if (Test-Path $p) { Remove-Item -Force $p; Write-OhdOk "Removed $p" }
 }
 
 if ($PurgeConfig) {
-    $home2 = (Get-OhdPaths).Home
-    Write-OhdInfo "Purging $home2 (instance metadata)"
-    Remove-Item -Recurse -Force -Path $home2 -ErrorAction SilentlyContinue
+    Write-OhdInfo "Purging $script:OhdHome (instance metadata only)"
+    Remove-Item -Recurse -Force -Path $script:OhdHome -ErrorAction SilentlyContinue
     Write-OhdOk "Done."
 }
 
@@ -44,7 +53,8 @@ Write-Host @"
 
 Uninstall complete.
 
-Kept on disk (your user data, NOT touched):
-    `$HOME/.openharness/   (skills, plugins, provider profiles, credentials)
-    `$HOME/.ohmo/          (ohmo workspace)
+NOTE: Per-instance OpenHarness state lives in Docker named volumes
+(oh-<instance>-home). If you did not pass -Volumes, that state is preserved.
+List with:    docker volume ls --filter name=^oh-
+Remove one:   docker volume rm oh-<name>-home
 "@ -ForegroundColor Green

@@ -1,30 +1,69 @@
 #!/usr/bin/env bash
-# oh-ctl - control multiple OpenHarness containers.
+# oh-ctl - control multiple OpenHarness sandbox instances.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/common.sh"
 
 usage() {
     cat <<EOF
-oh-ctl  -  manage OpenHarness Docker instances
+oh-ctl  -  manage OpenHarness sandbox instances
 
 Usage:
-  oh-ctl list                        List all instances and show the default one
-  oh-ctl set-default <name>          Set <name> as the default instance
-  oh-ctl unset-default               Clear the default instance
-  oh-ctl status [name]               Show container status (all if no name)
-  oh-ctl start [name]                Start a stopped container
-  oh-ctl stop [name]                 Stop a running container
-  oh-ctl restart [name]              Restart container (default if omitted)
-  oh-ctl logs [name] [-f]            Show container logs
-  oh-ctl shell [name]                Open an interactive bash inside container
-  oh-ctl exec <name> -- <cmd...>     Run a command inside a specific instance
-  oh-ctl rm <name> [--purge]         Remove the container (--purge also wipes its instance metadata)
-  oh-ctl info <name>                 Show instance details
+  oh-ctl list                          List all instances and the default one
+  oh-ctl set-default <name>            Set <name> as the default instance
+  oh-ctl unset-default                 Clear the default instance
+  oh-ctl status [name]                 Show container status (all if no name)
+  oh-ctl start [name]                  Start a stopped container
+  oh-ctl stop [name]                   Stop a running container
+  oh-ctl restart [name]                Restart container (default if omitted)
+  oh-ctl logs [name] [-f]              Show container logs
+  oh-ctl shell [name]                  Open an interactive bash inside a container
+  oh-ctl exec <name> -- <cmd...>       Run a command inside a specific instance
+  oh-ctl rm <name> [--purge]           Remove the container (--purge wipes home volume + metadata)
+  oh-ctl info <name>                   Show instance details (mounts, image, model, ...)
+
+  oh-ctl mount list [name]             List active sandbox mounts for an instance
+  oh-ctl mount add <host_path> [name] [--ro]
+                                       Add a host directory as a sandbox mount.
+                                       Requires recreating the container.
+  oh-ctl mount rm <host_path> [name]   Remove a sandbox mount.
+                                       Requires recreating the container.
 
 Tips:
   Set OH_INSTANCE=<name> in your shell to override the default temporarily.
+  Set OH_AUTO_MOUNT_CWD=1 to allow ad-hoc cwd mounting at \`oh\` time without
+  the [y/N] prompt (off by default for safety).
 EOF
+}
+
+# Look up the deploy.sh sibling (so 'mount add' can rebuild the container).
+ohd_deployer() {
+    local repo
+    repo="$(ohd_wrapper_repo_root)"
+    printf '%s/deploy.sh\n' "$repo"
+}
+
+# Recreate a container after the mounts list changed in config.
+# Preserves whatever the user's default-instance setting currently is
+# (we pass --no-default so this never accidentally promotes the instance).
+ohd_recreate_with_current_mounts() {
+    local instance="$1"
+    local deployer; deployer="$(ohd_deployer)"
+    [ -x "$deployer" ] || die "Cannot find deploy.sh at $deployer"
+    info "Recreating container for instance '$instance' with the updated mount list..."
+    # Build --mount args from the stored JSON list.
+    local args=(--name "$instance" --no-self-update --yes --no-default)
+    local mounts; mounts="$(ohd_instance_mounts_get "$instance")"
+    while IFS=$'\t' read -r mhost mtarget mro; do
+        [ -z "$mhost" ] && continue
+        if [ "$mro" = "true" ]; then
+            args+=(--mount "${mhost}:ro")
+        else
+            args+=(--mount "$mhost")
+        fi
+    done < <(printf '%s\n' "$mounts" | jq -r '.[] | [.host, .target, .readonly] | @tsv')
+    # Run deploy.sh; deploy.sh will recreate the container preserving the home volume.
+    "$deployer" "${args[@]}"
 }
 
 cmd="${1:-}"
@@ -121,12 +160,10 @@ case "$cmd" in
         ohd_instance_exists "$target" || die "No such instance: $target"
         cname="$(ohd_container_name "$target")"
         ohd_container_running "$cname" || docker start "$cname" >/dev/null
-        host_cwd="$(pwd)"
-        case "$host_cwd" in
-            /private/*) host_cwd_in="${host_cwd#/private}" ;;
-            *)          host_cwd_in="$host_cwd" ;;
-        esac
-        exec docker exec -it -w "$host_cwd_in" -e "OH_INSTANCE=$target" "$cname" oh-entrypoint exec -- bash -l
+        # In sandbox mode, $HOME is /oh-home (named volume); host cwd is
+        # NOT auto-mapped. The user can `cd /work/<mount>` from there.
+        exec docker exec -it -w "/oh-home" -e "OH_INSTANCE=$target" "$cname" \
+            oh-entrypoint exec -- bash -l
         ;;
 
     exec)
@@ -153,13 +190,13 @@ case "$cmd" in
             warn "No container '$cname' to remove."
         fi
         if [ "$purge" -eq 1 ]; then
-            per_inst_root="$(ohd_instance_get "$target" per_instance_root)"
+            home_vol="$(ohd_instance_get "$target" home_volume 2>/dev/null || true)"
+            [ -z "$home_vol" ] && home_vol="$(ohd_home_volume_name "$target")"
+            if docker volume inspect "$home_vol" >/dev/null 2>&1; then
+                docker volume rm "$home_vol" >/dev/null && ok "Home volume '$home_vol' removed"
+            fi
             ohd_instance_delete "$target"
             rm -rf "$OHD_INSTANCES_DIR/$target"
-            if [ -n "$per_inst_root" ] && [ -d "$per_inst_root" ]; then
-                rm -rf "$per_inst_root"
-                ok "Per-instance state purged: $per_inst_root"
-            fi
             ok "Instance metadata for '$target' purged."
         else
             info "Instance metadata kept; redeploy with: ./deploy.sh --name $target"
@@ -171,6 +208,85 @@ case "$cmd" in
         [ -z "$target" ] && die "Usage: oh-ctl info <name>"
         ohd_instance_exists "$target" || die "No such instance: $target"
         ohd_config_read | jq --arg n "$target" '.instances[$n] | {name: $n} + .'
+        ;;
+
+    mount)
+        sub="${1:-}"; shift || true
+        case "$sub" in
+            list)
+                target="${1:-$(ohd_default_instance)}"
+                [ -z "$target" ] && die "No instance specified and no default set."
+                ohd_instance_exists "$target" || die "No such instance: $target"
+                ohd_instance_mounts_get "$target" | jq -r \
+                  '.[] | "  \(.host)  ->  \(.target)\(if .readonly then "  :ro" else "" end)"'
+                ;;
+            add)
+                hp="${1:-}"; shift || true
+                [ -z "$hp" ] && die "Usage: oh-ctl mount add <host_path> [instance] [--ro]"
+                target=""
+                ro=0
+                for a in "$@"; do
+                    case "$a" in
+                        --ro|:ro) ro=1 ;;
+                        *) target="$a" ;;
+                    esac
+                done
+                [ -z "$target" ] && target="$(ohd_default_instance)"
+                [ -z "$target" ] && die "No instance specified and no default set."
+                ohd_instance_exists "$target" || die "No such instance: $target"
+                ohd_assert_mount_safe "$hp"
+                canonical="$(ohd_canonicalise "$hp")"
+                [ -d "$canonical" ] || die "$hp is not a directory."
+                # Reject duplicates.
+                existing="$(ohd_instance_mounts_get "$target")"
+                if printf '%s' "$existing" | jq -e --arg h "$canonical" 'any(.host == $h)' >/dev/null; then
+                    die "Mount '$canonical' is already attached to instance '$target'."
+                fi
+                # Pick a target path that doesn't collide with existing.
+                base="$(basename -- "$canonical")"
+                base="${base//[^A-Za-z0-9._-]/_}"
+                [ -z "$base" ] && base="root"
+                cand="$(ohd_container_target_for "$canonical")"
+                n=2
+                while printf '%s' "$existing" | jq -e --arg t "$cand" 'any(.target == $t)' >/dev/null; do
+                    cand="$(ohd_container_target_for "$canonical" "$n")"
+                    n=$((n+1))
+                done
+                ohd_instance_mount_add "$target" "$canonical" "$cand" "$ro"
+                ok "Recorded mount: $canonical -> $cand$( [ "$ro" -eq 1 ] && echo " :ro" )"
+                ohd_recreate_with_current_mounts "$target"
+                ;;
+            rm|remove)
+                hp="${1:-}"; shift || true
+                [ -z "$hp" ] && die "Usage: oh-ctl mount rm <host_path> [instance]"
+                target="${1:-$(ohd_default_instance)}"
+                [ -z "$target" ] && die "No instance specified and no default set."
+                ohd_instance_exists "$target" || die "No such instance: $target"
+                canonical="$(ohd_canonicalise "$hp")"
+                existing="$(ohd_instance_mounts_get "$target")"
+                if ! printf '%s' "$existing" | jq -e --arg h "$canonical" 'any(.host == $h)' >/dev/null; then
+                    die "Mount '$canonical' is not attached to instance '$target'."
+                fi
+                new_arr="$(printf '%s' "$existing" | jq --arg h "$canonical" '[.[] | select(.host != $h)]')"
+                printf '%s' "$new_arr" | ohd_instance_mounts_set "$target"
+                ok "Removed mount: $canonical"
+                ohd_recreate_with_current_mounts "$target"
+                ;;
+            ""|-h|--help)
+                cat <<EOF
+oh-ctl mount  -  manage sandbox mounts
+
+  oh-ctl mount list [instance]
+  oh-ctl mount add  <host_path> [instance] [--ro]
+  oh-ctl mount rm   <host_path> [instance]
+
+Adding or removing a mount recreates the container. The named-volume HOME
+(\$HOME inside the container) is preserved across the recreation, so the
+agent's openharness profile and conversation history are kept.
+EOF
+                ;;
+            *) die "Unknown 'mount' subcommand: $sub" ;;
+        esac
         ;;
 
     *)

@@ -1,6 +1,19 @@
 # shellcheck shell=bash
 # Common library for OpenHarness Dockerized scripts.
 # Source this file from every script:  . "$(dirname "$0")/lib/common.sh"
+#
+# Security note (read SECURITY.md for the full picture):
+#   The wrapper repo uses a SANDBOX isolation model. The container has NO
+#   host filesystem access except through paths the user explicitly mounts.
+#   This file therefore provides:
+#     - a sensitive-paths blacklist (ohd_assert_mount_safe)
+#     - host -> container path mapping (ohd_container_target_for)
+#     - the helper that runs `oh ...` against a sandboxed instance,
+#       optionally adding the host CWD as a one-off mount after a [y/N]
+#       confirmation (ohd_exec_in_container).
+#
+# This file MUST NOT introduce any code path that bind-mounts $HOME
+# wholesale, or that resurrects the old "transparency contract".
 
 set -o pipefail
 
@@ -12,38 +25,12 @@ OHD_SHIM_BIN_DIR="${OHD_SHIM_BIN_DIR:-$HOME/.local/bin}"
 OHD_IMAGE_TAG_DEFAULT="openharness-dockerized:latest"
 OHD_CONTAINER_PREFIX="oh-"
 OHD_LABEL="dev.openharness.dockerized=1"
-
-# ---------------- isolation helpers ----------------
-# The "wrapper repo" is THIS git repository (the one containing deploy.sh, the
-# Dockerfile, etc).  It must stay fully isolated from any container we spawn:
-#   * containers must not be able to read or modify its files,
-#   * pulling/pushing this repo must not affect a running container,
-#   * the agent inside a container must not pretend it can edit our scripts.
-#
-# We enforce this with a "shadow" mount: when the wrapper repo path happens to
-# fall inside a bind-mount we're about to attach (typical case: someone clones
-# this repo under their $HOME), we add a second `-v` that overlays a tmpfs (or
-# anonymous volume) at the same in-container path. The container sees an empty
-# directory there; any writes go into the throwaway overlay.
-ohd_wrapper_repo_root() {
-    # Echo the absolute path to the wrapper repo (the directory holding
-    # deploy.sh / Dockerfile / scripts/).  Resolves symlinks.
-    local here
-    here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-    echo "$here"
-}
-
-# Is path $1 inside path $2? (string-prefix; both must be absolute, no trailing /).
-ohd_path_is_inside() {
-    local child parent
-    child="${1%/}"
-    parent="${2%/}"
-    [ "$child" = "$parent" ] && return 0
-    case "$child/" in
-        "$parent"/*) return 0 ;;
-        *)           return 1 ;;
-    esac
-}
+OHD_LABEL_SANDBOX="dev.openharness.sandbox=1"
+# Inside the container, every host-side mount lives under this prefix.
+OHD_WORK_PREFIX="/work"
+# Sandbox runs as this UID:GID. Must match Dockerfile ARG SANDBOX_UID/GID.
+OHD_SANDBOX_UID="${OHD_SANDBOX_UID:-1000}"
+OHD_SANDBOX_GID="${OHD_SANDBOX_GID:-1000}"
 
 # ---------------- colored logging ----------------
 if [ -t 1 ]; then
@@ -92,25 +79,174 @@ ohd_require_docker() {
     docker info >/dev/null 2>&1 || die "Docker daemon is not reachable. Start Docker first."
 }
 
-# ---------------- dependency installer ----------------
-# Strategy:
-#   - jq is small, ubiquitous, safe to auto-install.
-#   - docker is NOT auto-installed: rootful install touches systemd / cgroups /
-#     user groups / vendor repos; getting that wrong on a production VM is much
-#     worse than a clear error message. We just print the right command.
-#   - git is only needed for the self-update path; that path already degrades
-#     gracefully when git is missing.
-#
-# Honors:
-#   * --no-auto-install / -NoAutoInstall flag on deploy
-#   * OH_DEPLOYER_NO_AUTO_INSTALL=1 environment variable
-#   * non-interactive shells (auto-accept the install, just like self-update)
+# ---------------- path helpers ----------------
+ohd_wrapper_repo_root() {
+    # Echo the absolute path to the wrapper repo (the directory holding
+    # deploy.sh / docker/ / scripts/). Resolves symlinks.
+    local here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+    echo "$here"
+}
 
-# Detect the distro ID (from /etc/os-release). Examples:
-#   debian, ubuntu, raspbian, kali
-#   rhel, centos, rocky, almalinux, tencentos, fedora, ol, amzn
-#   alpine, arch, manjaro, opensuse-leap, opensuse-tumbleweed
-#   darwin, ""(unknown)
+# Canonicalise a path. realpath -m tolerates non-existent paths.
+ohd_canonicalise() {
+    local p="$1"
+    [ -z "$p" ] && return 1
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$p"
+    else
+        # best-effort fallback (won't follow symlinks correctly without realpath)
+        case "$p" in
+            /*) printf '%s\n' "$p" ;;
+            *)  printf '%s\n' "$(pwd -P)/$p" ;;
+        esac
+    fi
+}
+
+# Is path $1 inside path $2? (string-prefix; both must be absolute, no
+# trailing /). Returns 0 if equal or descendant.
+ohd_path_is_inside() {
+    local child parent
+    child="${1%/}"
+    parent="${2%/}"
+    [ -z "$parent" ] && parent="/"
+    [ "$child" = "$parent" ] && return 0
+    case "$child/" in
+        "$parent"/*) return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
+# Build the array of host paths that must NEVER be exposed inside a
+# sandbox. We use bash arrays so callers can `for s in "${OHD_SENSITIVE_PATHS[@]}"`.
+# This is recomputed every call so $HOME changes are honored.
+ohd_build_sensitive_paths() {
+    OHD_SENSITIVE_PATHS=(
+        # System-level
+        "/"
+        "/root"
+        "/home"
+        "/etc"
+        "/var"
+        "/usr"
+        "/boot"
+        "/sys"
+        "/proc"
+        "/dev"
+        "/run"
+        "/lib"
+        "/lib64"
+        "/sbin"
+        "/bin"
+        "/srv"
+        "/opt"
+        # Docker / container control planes (escape primitives)
+        "/var/run/docker.sock"
+        "/run/docker.sock"
+        "/var/run/containerd"
+        "/run/containerd"
+        "/var/lib/docker"
+        "/var/lib/containerd"
+        "/var/lib/kubelet"
+        # WSL plumbing
+        "/mnt/wsl"
+    )
+    if [ -n "${HOME:-}" ]; then
+        OHD_SENSITIVE_PATHS+=(
+            "$HOME"
+            "$HOME/.ssh"
+            "$HOME/.aws"
+            "$HOME/.azure"
+            "$HOME/.gcp"
+            "$HOME/.gcloud"
+            "$HOME/.docker"
+            "$HOME/.kube"
+            "$HOME/.gnupg"
+            "$HOME/.config"
+            "$HOME/.netrc"
+            "$HOME/.openharness"
+            "$HOME/.openharness-docker"
+            "$HOME/.openharness-instances"
+            "$HOME/.bash_history"
+            "$HOME/.zsh_history"
+        )
+    fi
+    # Also add the wrapper repo itself: the agent must never modify the
+    # scripts that run it.
+    local wrapper; wrapper="$(ohd_wrapper_repo_root 2>/dev/null || true)"
+    [ -n "$wrapper" ] && OHD_SENSITIVE_PATHS+=("$wrapper")
+}
+
+# Hard-fail if a host path requested for mount is unsafe.
+# Rejects when:
+#   * the path resolves to one of OHD_SENSITIVE_PATHS, OR
+#   * it is inside one of them, OR
+#   * one of them is inside it (to catch e.g. --mount /home which would
+#     expose every user's $HOME).
+# Also rejects symlinks (caller must pass the resolved real path).
+ohd_assert_mount_safe() {
+    local raw="$1"
+    local cpath
+    cpath="$(ohd_canonicalise "$raw")" || die "cannot canonicalise mount path: $raw"
+    [ "$cpath" = "/" ] && die "refusing to mount '/' into the sandbox."
+
+    if [ -L "$raw" ]; then
+        die "mount '$raw' is a symlink (target='$(readlink -- "$raw" 2>/dev/null || true)'); pass the resolved target after re-checking it."
+    fi
+
+    if [ -e "$cpath" ] && [ ! -d "$cpath" ]; then
+        die "mount '$raw' (canonical '$cpath') is not a directory; refusing."
+    fi
+
+    ohd_build_sensitive_paths
+    local s
+    for s in "${OHD_SENSITIVE_PATHS[@]}"; do
+        if ohd_path_is_inside "$cpath" "$s"; then
+            die "mount '$raw' (canonical '$cpath') is inside or equal to sensitive path '$s'; refusing. See SECURITY.md."
+        fi
+        if ohd_path_is_inside "$s" "$cpath"; then
+            die "mount '$raw' (canonical '$cpath') would expose sensitive path '$s'; refusing. See SECURITY.md."
+        fi
+    done
+    return 0
+}
+
+# Map a host path to its in-container target.
+#   /data/proj      ->   /work/proj
+#   /opt/code/foo   ->   /work/foo
+# Multiple mounts with the same basename get suffixed (-2, -3, ...). The
+# caller is responsible for tracking suffixes when assembling docker args.
+ohd_container_target_for() {
+    local host_path="$1"
+    local suffix="${2:-}"
+    local base
+    base="$(basename -- "$host_path")"
+    [ -z "$base" ] && base="root"
+    base="${base//[^A-Za-z0-9._-]/_}"
+    if [ -n "$suffix" ]; then
+        printf '%s/%s-%s\n' "$OHD_WORK_PREFIX" "$base" "$suffix"
+    else
+        printf '%s/%s\n' "$OHD_WORK_PREFIX" "$base"
+    fi
+}
+
+# Build a `--mount=type=bind,...` arg from a (host_path, ro?, target?) triple.
+# Echoes the docker arg on stdout.
+ohd_docker_mount_arg() {
+    local host_path="$1"
+    local ro="${2:-0}"
+    local target="${3:-}"
+    [ -z "$target" ] && target="$(ohd_container_target_for "$host_path")"
+    if [ "$ro" -eq 1 ]; then
+        printf -- '--mount=type=bind,source=%s,target=%s,readonly,bind-recursive=disabled\n' \
+            "$host_path" "$target"
+    else
+        printf -- '--mount=type=bind,source=%s,target=%s,bind-recursive=disabled\n' \
+            "$host_path" "$target"
+    fi
+}
+
+# ---------------- dependency installer ----------------
 ohd_detect_distro_id() {
     if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
         echo darwin; return
@@ -123,8 +259,6 @@ ohd_detect_distro_id() {
     echo ""
 }
 
-# Detect the system package manager. Echoes one of: apt | dnf | yum | apk |
-# pacman | zypper | brew | "" (none recognised).
 ohd_detect_pkg_manager() {
     if   command -v apt-get >/dev/null 2>&1; then echo apt
     elif command -v dnf     >/dev/null 2>&1; then echo dnf
@@ -137,8 +271,6 @@ ohd_detect_pkg_manager() {
     fi
 }
 
-# Return the install command (as a single shell string) for the given pkg
-# manager and package name. Empty string if unknown.
 ohd_pkg_install_cmd() {
     local pm="$1" pkg="$2"
     case "$pm" in
@@ -153,14 +285,8 @@ ohd_pkg_install_cmd() {
     esac
 }
 
-# Decide whether the deployer is permitted to auto-install (asks the user when
-# interactive). Returns 0 = go ahead, 1 = do not install.
-#
-# Supports a "yes for all" mode: when the user picks [a] at any prompt, we set
-# OHD_ASSUME_YES_ALL=1 for the rest of this process; subsequent dependencies
-# install without re-prompting.
 ohd_auto_install_allowed() {
-    local pkg="$1"   # for the prompt message
+    local pkg="$1"
     [ "${OH_DEPLOYER_NO_AUTO_INSTALL:-0}" = "1" ] && return 1
     [ "${OHD_NO_AUTO_INSTALL:-0}"          = "1" ] && return 1
     [ "${OHD_ASSUME_YES_ALL:-0}"           = "1" ] && {
@@ -185,7 +311,6 @@ ohd_auto_install_allowed() {
     return 0
 }
 
-# Run a privileged shell command; uses sudo when not already root.
 ohd_run_privileged() {
     local cmd="$1"
     if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
@@ -199,16 +324,12 @@ ohd_run_privileged() {
     fi
 }
 
-# Ensure jq is installed. Tries auto-install when allowed; otherwise prints the
-# exact command for the detected platform and exits.
 ohd_ensure_jq() {
     command -v jq >/dev/null 2>&1 && return 0
-
     local pm cmd distro
     pm="$(ohd_detect_pkg_manager)"
     distro="$(ohd_detect_distro_id)"
     cmd="$(ohd_pkg_install_cmd "$pm" jq)"
-
     if [ -z "$cmd" ]; then
         err "'jq' is required but no supported package manager was found."
         info "Detected distro: ${distro:-unknown}"
@@ -216,11 +337,9 @@ ohd_ensure_jq() {
         info "  See https://jqlang.org/download/"
         exit 1
     fi
-
     warn "'jq' is required but not installed."
     info "Detected distro: ${distro:-unknown}   package manager: $pm"
     info "Would run: $cmd"
-
     if ohd_auto_install_allowed jq; then
         if ohd_run_privileged "$cmd"; then
             command -v jq >/dev/null 2>&1 \
@@ -237,20 +356,13 @@ ohd_ensure_jq() {
     fi
 }
 
-# Ensure docker is present. Tries to install when the user agrees; the
-# install command set is distro-specific.
 ohd_ensure_docker() {
     command -v docker >/dev/null 2>&1 && return 0
-
     local pm distro
     pm="$(ohd_detect_pkg_manager)"
     distro="$(ohd_detect_distro_id)"
-
     warn "'docker' CLI is required but not installed."
     info "Detected distro: ${distro:-unknown}   package manager: ${pm:-unknown}"
-
-    # Build a list of install steps for the prompt. Each step is a single shell
-    # command that 'ohd_run_privileged' will execute (root or via sudo).
     local steps=() post_hint=""
     case "$pm" in
         apt)
@@ -268,8 +380,6 @@ ohd_ensure_docker() {
             post_hint="If your user is not root, run:  sudo usermod -aG docker \"\$USER\"   and re-login."
             ;;
         dnf|yum)
-            # For Amazon Linux 2/2023 'amazon-linux-extras' / 'dnf install docker' works too,
-            # but the Docker CE repo path is the most universally-correct way.
             local family="centos"
             case "$distro" in
                 fedora) family="fedora" ;;
@@ -306,7 +416,6 @@ ohd_ensure_docker() {
             post_hint="If your user is not root, run:  sudo usermod -aG docker \"\$USER\"   and re-login."
             ;;
         brew)
-            # macOS: brew cask installs the Desktop app; user must launch it.
             err "Docker Desktop must be installed manually on macOS."
             info "  brew install --cask docker"
             info "After install, launch Docker.app once so the engine starts, then re-run ./deploy.sh."
@@ -318,8 +427,6 @@ ohd_ensure_docker() {
             exit 1
             ;;
     esac
-
-    # Show the user what we are about to run.
     echo
     info "Would run the following commands (as root) to install Docker:"
     for s in "${steps[@]}"; do
@@ -328,7 +435,6 @@ ohd_ensure_docker() {
     [ -n "$post_hint" ] && info "  Post-install: $post_hint"
     echo
     warn "Installing Docker touches systemd, repos and user groups; review the commands above."
-
     if ohd_auto_install_allowed docker; then
         local s rc=0
         for s in "${steps[@]}"; do
@@ -362,7 +468,7 @@ ohd_init_config() {
     if [ ! -f "$OHD_CONFIG" ]; then
         cat > "$OHD_CONFIG" <<'EOF'
 {
-  "version": 1,
+  "version": 2,
   "default_instance": null,
   "instances": {}
 }
@@ -377,7 +483,6 @@ ohd_config_read() {
 }
 
 ohd_config_write() {
-    # stdin: full JSON
     ohd_require_jq
     local tmp
     tmp="$(mktemp)"
@@ -405,12 +510,10 @@ ohd_instance_exists() {
 }
 
 ohd_instance_get() {
-    # $1=name $2=field
     ohd_config_read | jq -r --arg n "$1" --arg f "$2" '.instances[$n][$f] // empty'
 }
 
 ohd_instance_upsert() {
-    # $1=name; rest are k=v pairs (strings only)
     local name="$1"; shift
     local payload='{}'
     while [ $# -gt 0 ]; do
@@ -422,6 +525,30 @@ ohd_instance_upsert() {
         | jq --arg n "$name" --argjson p "$payload" \
             '.instances[$n] = ((.instances[$n] // {}) + $p)' \
         | ohd_config_write
+}
+
+# Append a mount entry to instance.<name>.mounts.
+# Args: name, host_path, target, readonly(0|1).
+ohd_instance_mount_add() {
+    local name="$1" host="$2" target="$3" ro="${4:-0}"
+    ohd_config_read \
+        | jq --arg n "$name" --arg h "$host" --arg t "$target" --argjson r "$ro" '
+            .instances[$n] |= ((. // {}) | (.mounts |= ((. // []) + [{host:$h, target:$t, readonly:($r==1)}])))
+          ' \
+        | ohd_config_write
+}
+
+ohd_instance_mounts_set() {
+    # stdin: JSON array; replace .instances[name].mounts
+    local name="$1"
+    local arr; arr="$(cat)"
+    ohd_config_read \
+        | jq --arg n "$name" --argjson m "$arr" '.instances[$n].mounts = $m' \
+        | ohd_config_write
+}
+
+ohd_instance_mounts_get() {
+    ohd_config_read | jq -r --arg n "$1" '.instances[$n].mounts // [] | tojson'
 }
 
 ohd_instance_delete() {
@@ -436,6 +563,7 @@ ohd_instance_delete() {
 
 # ---------------- container naming ----------------
 ohd_container_name() { echo "${OHD_CONTAINER_PREFIX}$1"; }
+ohd_home_volume_name() { echo "oh-${1}-home"; }
 
 ohd_container_running() {
     local cname="$1"
@@ -459,12 +587,6 @@ ohd_print_instance_row() {
 }
 
 # ---------------- helpers for transparent invocation ----------------
-# Pick the target instance name based on:
-#   - $OH_INSTANCE override (env)
-#   - --name argument (handled by caller before calling this)
-#   - default_instance from config
-#   - if exactly one instance exists, use it
-#   - if multiple, error and prompt user
 ohd_resolve_instance() {
     local explicit="${1:-}"
     if [ -n "$explicit" ]; then
@@ -478,7 +600,6 @@ ohd_resolve_instance() {
     if [ -n "$d" ] && ohd_instance_exists "$d"; then
         echo "$d"; return 0
     fi
-    # No default — pick if only one exists
     local names; names="$(ohd_list_instance_names)"
     local count; count="$(printf '%s\n' "$names" | grep -c .)" || true
     if [ "$count" = "1" ]; then
@@ -495,10 +616,89 @@ ohd_resolve_instance() {
     return 3
 }
 
-# Run a command inside a container with proper TTY/stdin handling and cwd-preservation.
+# Given an instance name and a host path, return the in-container path that
+# the path is exposed at, or empty if the path is not in any of the
+# instance's mounts. We honor multi-level matches (longest mount prefix wins).
+ohd_resolve_host_path_to_container() {
+    local instance="$1"
+    local host_path="$2"
+    [ -z "$host_path" ] && return 0
+    local cpath; cpath="$(ohd_canonicalise "$host_path")" || return 0
+    local mounts; mounts="$(ohd_instance_mounts_get "$instance")"
+    [ -z "$mounts" ] && return 0
+    local best_host="" best_target=""
+    # Iterate via jq; for each {host,target,readonly}, see if cpath is inside host.
+    while IFS=$'\t' read -r mhost mtarget; do
+        [ -z "$mhost" ] && continue
+        if ohd_path_is_inside "$cpath" "$mhost"; then
+            # Prefer longer host prefix.
+            if [ ${#mhost} -gt ${#best_host} ]; then
+                best_host="$mhost"
+                best_target="$mtarget"
+            fi
+        fi
+    done < <(printf '%s\n' "$mounts" | jq -r '.[] | [.host, .target] | @tsv')
+    if [ -n "$best_host" ]; then
+        local rel="${cpath#$best_host}"
+        rel="${rel#/}"
+        if [ -z "$rel" ]; then
+            printf '%s\n' "$best_target"
+        else
+            printf '%s/%s\n' "$best_target" "$rel"
+        fi
+        return 0
+    fi
+    return 0
+}
+
+# Prompt the user "Add this host path as a one-off sandbox mount? [y/N]".
+# Returns 0 = yes, 1 = no. Honors:
+#   - OH_AUTO_MOUNT_CWD=1   : auto-yes (CI / power user)
+#   - OH_AUTO_MOUNT_CWD=0   : auto-no
+#   - non-tty               : auto-no (safer default)
+ohd_confirm_cwd_mount() {
+    local host_path="$1"
+    case "${OH_AUTO_MOUNT_CWD:-}" in
+        1|y|Y|yes|YES) info "OH_AUTO_MOUNT_CWD=1 -> mounting $host_path"; return 0 ;;
+        0|n|N|no|NO)   info "OH_AUTO_MOUNT_CWD=0 -> NOT mounting $host_path"; return 1 ;;
+    esac
+    if ! { [ -t 0 ] && [ -t 1 ]; }; then
+        warn "Non-interactive shell; refusing to auto-mount '$host_path'."
+        warn "Set OH_AUTO_MOUNT_CWD=1 to allow, or pre-add it via:  oh-ctl mount add $host_path"
+        return 1
+    fi
+    echo                                                                       >&2
+    warn "About to expose host path inside the sandbox:"                       >&2
+    warn "    $host_path"                                                      >&2
+    warn "The agent will be able to read AND WRITE everything under it."       >&2
+    warn "If this contains secrets, credentials or anything you wouldn't paste"
+    warn "into a public chat, answer 'n' and run from a different directory."
+    local ans=""
+    printf "? Mount it for this command? [y/N] " >&2
+    read -r ans || ans=""
+    case "${ans:-N}" in
+        y|Y|yes|YES) return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
+# Run a command inside an instance, with the host CWD optionally mounted.
+# Strategy:
+#   - If host cwd resolves into an existing mount, reuse it (just `docker exec
+#     -w <container_path>`).
+#   - Else, ask the user. If yes, spawn a one-off `docker run --rm` container
+#     that shares the home volume with the long-lived idle container BUT
+#     ADDITIONALLY mounts the host cwd at /work/<basename>. The long-lived
+#     idle container is unaffected.
+#   - Else, fall back to /oh-home and warn that the agent cannot see the
+#     host cwd.
 ohd_exec_in_container() {
     local instance="$1"; shift
     local cname; cname="$(ohd_container_name "$instance")"
+    local home_vol; home_vol="$(ohd_home_volume_name "$instance")"
+    local image; image="$(ohd_instance_get "$instance" image)"
+    [ -z "$image" ] && image="$OHD_IMAGE_TAG_DEFAULT"
+
     if ! ohd_container_running "$cname"; then
         if ohd_container_exists "$cname"; then
             info "Instance '$instance' is stopped. Starting..."
@@ -507,37 +707,77 @@ ohd_exec_in_container() {
             die "Instance '$instance' has no container. Run ./deploy.sh"
         fi
     fi
-    # Decide TTY flags
+
     local tflags="-i"
     if [ -t 0 ] && [ -t 1 ]; then tflags="-it"; fi
 
-    # cwd: container path equals host path because we mount $HOME identically
-    local host_cwd; host_cwd="$(pwd)"
-    # Make sure we don't lose path on macOS where /tmp -> /private/tmp etc.
+    local host_cwd; host_cwd="$(pwd -P)"
     case "$host_cwd" in
-        /private/*) host_cwd_in="${host_cwd#/private}" ;;
-        *)          host_cwd_in="$host_cwd" ;;
+        /private/*) host_cwd="${host_cwd#/private}" ;;  # macOS canonical
     esac
 
-    # Probe: is this path visible inside the container?
-    # If not, fall back to the instance's host_home with a friendly warning.
-    if ! docker exec "$cname" test -d "$host_cwd_in" 2>/dev/null; then
-        local fallback
-        fallback="$(ohd_instance_get "$instance" host_home)"
-        [ -z "$fallback" ] && fallback="/"
-        warn "Path not visible inside container '$instance':"
-        warn "    host cwd : $host_cwd"
-        warn "    expected : $host_cwd_in"
-        warn "Falling back to: $fallback"
-        warn "Tip: redeploy with  --extra-mount '$host_cwd'  to add this path to the container."
-        host_cwd_in="$fallback"
+    local container_cwd
+    container_cwd="$(ohd_resolve_host_path_to_container "$instance" "$host_cwd")"
+
+    if [ -n "$container_cwd" ]; then
+        # CWD already in scope -- use the long-lived container.
+        docker exec $tflags \
+            -e "OH_INSTANCE=$instance" \
+            -e "TERM=${TERM:-xterm-256color}" \
+            -e "COLORTERM=${COLORTERM:-truecolor}" \
+            -w "$container_cwd" \
+            "$cname" \
+            oh-entrypoint exec -- "$@"
+        return $?
     fi
 
+    # CWD not in any existing mount. Ask whether to add it as an EPHEMERAL
+    # mount.
+    if ohd_assert_mount_safe "$host_cwd" 2>/dev/null && ohd_confirm_cwd_mount "$host_cwd"; then
+        local target; target="$(ohd_container_target_for "$host_cwd")"
+        local mount_arg; mount_arg="$(ohd_docker_mount_arg "$host_cwd" 0 "$target")"
+        # One-off container: same home volume so config persists, same network
+        # mode, same hardening, plus this single extra mount.
+        docker run --rm $tflags \
+            --label "$OHD_LABEL" \
+            --label "$OHD_LABEL_SANDBOX" \
+            --label "dev.openharness.instance=$instance" \
+            --label "dev.openharness.ephemeral=1" \
+            --user "$OHD_SANDBOX_UID:$OHD_SANDBOX_GID" \
+            --read-only \
+            --tmpfs "/tmp:size=512m,mode=1777,nosuid,nodev,noexec" \
+            --tmpfs "/run:size=64m,mode=755,nosuid,nodev,noexec" \
+            -v "${home_vol}:/oh-home" \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges:true \
+            --pids-limit 512 \
+            --memory 4g \
+            --cpus 2 \
+            --add-host "metadata.google.internal:127.0.0.1" \
+            --add-host "metadata.tencentyun.com:127.0.0.1" \
+            --add-host "metadata.aliyuncs.com:127.0.0.1" \
+            --add-host "metadata.azure.com:127.0.0.1" \
+            --add-host "169.254.169.254:127.0.0.1" \
+            -e "HOME=/oh-home" \
+            -e "OH_INSTANCE=$instance" \
+            -e "TERM=${TERM:-xterm-256color}" \
+            -e "COLORTERM=${COLORTERM:-truecolor}" \
+            -w "$target" \
+            "$mount_arg" \
+            "$image" \
+            oh-entrypoint exec -- "$@"
+        return $?
+    fi
+
+    # User said no, or path was sensitive. Run inside the long-lived container
+    # with cwd = /oh-home, and warn loudly.
+    warn "Running '$1' from /oh-home; the agent cannot see your host cwd ($host_cwd)."
+    warn "To make a host directory available, run:  oh-ctl mount add <host_path>"
     docker exec $tflags \
         -e "OH_INSTANCE=$instance" \
         -e "TERM=${TERM:-xterm-256color}" \
         -e "COLORTERM=${COLORTERM:-truecolor}" \
-        -w "$host_cwd_in" \
+        -w "/oh-home" \
         "$cname" \
         oh-entrypoint exec -- "$@"
 }

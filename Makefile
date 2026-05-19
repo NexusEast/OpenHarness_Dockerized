@@ -28,10 +28,9 @@ uninstall: ## Remove containers and shims (keep user data)
 shims: ## (Re)install host shims to ~/.local/bin
 	./scripts/install-shims.sh --repo $(CURDIR)
 
-build: ## Build the docker image only
+build: ## Build the docker image only (sandbox image; UID/GID baked at build time)
 	docker build -t openharness-dockerized:latest \
-	  --build-arg HOST_UID=$$(id -u) --build-arg HOST_GID=$$(id -g) \
-	  --build-arg HOST_USER=$$(id -un) --build-arg HOST_HOME=$$HOME \
+	  --build-arg SANDBOX_UID=1000 --build-arg SANDBOX_GID=1000 \
 	  ./docker
 
 .PHONY: help deploy list status restart update-oh update-deployer uninstall shims build

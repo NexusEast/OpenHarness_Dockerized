@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# OpenHarness Dockerized shim. Auto-generated; do not edit by hand.
+# OpenHarness sandbox shim. Auto-generated; do not edit by hand.
 #
 # This file is installed as ~/.local/bin/oh, ohmo, openh, openharness.
 # It detects which name it was invoked as and forwards to the right binary
-# inside the chosen OH container.
+# inside the chosen sandbox container.
 #
 # Selection rules (first match wins):
 #   1. OH_INSTANCE env var
 #   2. --oh-instance NAME (consumed and removed before forwarding)
 #   3. config default_instance
 #   4. single instance
-# If none match → friendly error.
+# If none match -> friendly error.
+#
+# Sandbox semantics:
+#   The container has NO host filesystem access except paths the user has
+#   added via `oh-ctl mount add`. If your current host CWD is not inside
+#   any sandbox mount, this shim will:
+#     - run the command from /oh-home (with a warning), OR
+#     - if you set OH_AUTO_MOUNT_CWD=1, ask whether to mount the cwd
+#       ephemerally (a one-shot --rm container with the same hardening).
+#   Set OH_AUTO_MOUNT_CWD=1 to skip the [y/N] prompt.
+
+# Sentinel for install-shims.sh / deploy.sh -- DO NOT REMOVE.
+OHD_SHIM_TEMPLATE_VERSION=2
 
 set -euo pipefail
 
-# Locate this repo's lib (the shim is a copy, not a symlink, so rely on env).
 OHD_REPO="${OHD_REPO:-__OHD_REPO__}"
 . "$OHD_REPO/scripts/lib/common.sh"
 
-# Determine which CLI to invoke based on argv[0]
 prog="$(basename "$0")"
 case "$prog" in
     oh|openh|openharness) target_cli="oh" ;;
@@ -26,7 +36,6 @@ case "$prog" in
     *)                    target_cli="$prog" ;;
 esac
 
-# Pull --oh-instance out of args
 explicit_instance=""
 new_args=()
 while [ $# -gt 0 ]; do
@@ -40,12 +49,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Resolve which instance
 if ! instance="$(ohd_resolve_instance "$explicit_instance")"; then
     exit 1
 fi
 
-# Forward
 if [ ${#new_args[@]} -eq 0 ]; then
     ohd_exec_in_container "$instance" "$target_cli"
 else

@@ -1,319 +1,239 @@
-# OpenHarness Dockerized
+# OpenHarness Sandbox
 
-Run [HKUDS/OpenHarness](https://github.com/HKUDS/OpenHarness) inside Docker
-while keeping the host-side `oh` / `ohmo` commands feeling like a native
-install. No OpenHarness source code is vendored in this repo — the image is
-built fresh from `pip install openharness-ai`.
+> Run [HKUDS/OpenHarness](https://github.com/HKUDS/OpenHarness) (`oh`)
+> as a hardened Docker sandbox, without giving the agent any access to your
+> host filesystem.
 
-> Currently only **OpenRouter** is supported as the LLM backend.
+`oh` is a powerful agentic CLI. Powerful agentic CLIs that run with the
+privileges of the user who invoked them have all the privileges of that user
+— including the ability to read `~/.ssh/id_rsa`, write `~/.bashrc`, exfiltrate
+cloud credentials, or install persistence. **A "Docker wrapper" is not by
+itself a sandbox** — it just changes the layout. This repo provides an
+opinionated, hardened, red-team-validated sandbox where it actually is.
 
-## Why?
+> [!IMPORTANT]
+> Read [`SECURITY.md`](./SECURITY.md) before deploying to any machine that
+> stores secrets you care about. The threat model, the isolation contract,
+> and the residual risks (the OpenRouter key being readable inside the
+> sandbox; the container reaching your host's LAN by default) are all there.
 
-- You want the isolation, reproducibility and easy upgrades of a container,
-  **without** giving up the ergonomics of a CLI that just reads/writes the
-  files in your current directory.
-- You want to run multiple OpenHarness instances side by side (e.g. one per
-  project, or one per provider profile) and switch between them painlessly.
-- You don't want to litter your host with OH's runtime (Python venv, Node,
-  ripgrep, fd, dozens of pip packages…).
+## Table of contents
 
-## Features
+- [What you get](#what-you-get)
+- [Quick start](#quick-start)
+- [How to give the agent access to a directory](#how-to-give-the-agent-access-to-a-directory)
+- [How `oh` finds your code](#how-oh-finds-your-code)
+- [Multiple instances](#multiple-instances)
+- [Updating, restarting, removing](#updating-restarting-removing)
+- [Files in this repo](#files-in-this-repo)
+- [Red-team validation](#red-team-validation)
+- [FAQ](#faq)
 
-- **Zero-friction passthrough.** Host shims (`oh` / `ohmo` / `openh` /
-  `openharness` / `oh-ctl`) forward to `docker exec` transparently. Your
-  current working directory is preserved inside the container, and the files
-  the agent writes land directly on your host disk.
-- **Multiple instances.** Deploy as many containers as you like
-  (`oh-default`, `oh-work`, `oh-personal`, …). Select the target via a
-  default-instance mechanism, a per-call `--oh-instance NAME`, or
-  `OH_INSTANCE=NAME` in the environment.
-- **Persistent user config.** `~/.openharness`, `~/.ohmo`, `~/.claude`,
-  `~/.codex` are bind-mounted from your `$HOME`, so skills, plugins,
-  credentials and memory survive container recreations and are shared with
-  any future native install.
-- **No vendored OH source.** The `Dockerfile` does `pip install openharness-ai`
-  at build time. Upgrade by re-running `update-oh.sh` / `update-oh.ps1`.
-  To update the wrapper repo itself (this very tree), use
-  `update-deployer.sh` / `update-deployer.ps1`.
-- **OpenRouter wizard.** `deploy.sh` / `deploy.ps1` asks for your OpenRouter
-  API key + default model and writes the provider profile inside the
-  container for you.
-- **Cross-platform host.** macOS, Linux, WSL, and Windows PowerShell.
+## What you get
 
-## Platform support
+- **A non-root container** (UID 1000) with **all Linux capabilities dropped**,
+  **read-only rootfs**, and **no host filesystem access** beyond paths you
+  explicitly mount.
+- **Per-instance HOME on a Docker named volume** (`oh-<name>-home`).
+  Persistent across container recreates, **invisible** to the host's home
+  directory.
+- **Cloud metadata blackholed**: `169.254.169.254`,
+  `metadata.tencentyun.com`, `metadata.google.internal`,
+  `metadata.aliyuncs.com`, `metadata.azure.com` all resolve to `127.0.0.1`
+  inside the sandbox.
+- **A blacklist on `--mount`** that refuses sensitive host paths (`$HOME`,
+  `/etc`, `/var/run/docker.sock`, `~/.ssh`, `~/.aws`, …).
+- **An interactive `[y/N]` confirmation** if you run `oh` from a host
+  directory that isn't already mounted, because that's the moment a
+  user-confused-deputy mistake would actually expose data.
+- **`oh` / `ohmo` / `openh` / `oh-ctl`** shims so you keep the original
+  user experience.
+- A red-team rig at `sandbox/redteam/` that has been run against
+  `claude-opus-4.7` and `nemotron-3-super-120b` (both: 0 escapes).
 
-| Host shell           | Wizard           | Forwarded CLI names                              | Notes                                                                |
-| -------------------- | ---------------- | ------------------------------------------------ | -------------------------------------------------------------------- |
-| macOS                | `./deploy.sh`    | `oh` / `ohmo` / `openh` / `openharness` / `oh-ctl` | Mount source = host path (identical)                                 |
-| Linux                | `./deploy.sh`    | same                                             | Same                                                                 |
-| WSL (Debian/Ubuntu)  | `./deploy.sh`    | same                                             | Uses Docker Desktop's daemon under the hood                          |
-| Windows PowerShell   | `.\deploy.ps1`   | `openh` / `ohmo` / `openharness` / `oh-ctl`      | No `oh` shim (PowerShell aliases `oh` to `Out-Host`); use `openh`    |
-
-`.cmd` wrappers are installed too, so Windows `cmd.exe` works as well
-(`openh.cmd ...`). All shells share the same docker daemon, the same image,
-and the same `~/.openharness-docker/config.json`.
-
-## Requirements
-
-- **Docker** 24+ (Docker Desktop on Windows/macOS works out of the box)
-- **bash** (or PowerShell 7+ on Windows)
-- **jq** (only required by the `*.sh` scripts on \*nix)
-- Internet access to `pypi.org` and `docker.io` when first building the image
-- An **OpenRouter** API key — get one at https://openrouter.ai/keys
+Supported hosts: macOS, Linux, WSL2, Windows (with Docker Desktop + WSL2
+integration).
 
 ## Quick start
 
-### macOS / Linux / WSL
+```bash
+git clone <this-repo> openharness-sandbox
+cd openharness-sandbox
+
+# Linux / macOS / WSL
+./deploy.sh
+
+# Windows PowerShell
+.\deploy.ps1
+```
+
+The wizard:
+
+1. asks for an instance name (default: `default`),
+2. asks for your OpenRouter API key (get one at
+   [openrouter.ai/keys](https://openrouter.ai/keys); **use a sub-key with a
+   budget cap** — the agent inside the sandbox can read it),
+3. builds the Docker image (first time only),
+4. creates the hardened container,
+5. installs shims to `~/.local/bin` (sh) or `%USERPROFILE%\.openharness-docker\bin`
+   (ps1).
+
+After it finishes, the agent has **no host filesystem access**. That's
+intentional. To give it some, use `oh-ctl mount`:
+
+## How to give the agent access to a directory
 
 ```bash
-git clone https://github.com/NexusEast/OpenHarness_Dockerized.git
-cd OpenHarness_Dockerized
-./setup-permissions.sh         # +x for all .sh (if cloned on Windows / NTFS)
-./deploy.sh                    # interactive wizard
-oh                             # use it just like the native CLI
-ohmo init                      # initialize your ohmo workspace
+# Expose the host directory /data/proj read-write inside the sandbox.
+# It will appear inside the container at /work/proj.
+oh-ctl mount add /data/proj
+
+# Read-only:
+oh-ctl mount add /data/docs --ro
+
+# List active mounts for an instance:
+oh-ctl mount list
+
+# Remove:
+oh-ctl mount rm /data/proj
 ```
 
-### Windows PowerShell
+Adding or removing a mount **recreates the container**. Your openharness
+profile, conversation history, etc. live in the named volume HOME and
+survive the recreation.
 
-```powershell
-git clone https://github.com/NexusEast/OpenHarness_Dockerized.git
-cd OpenHarness_Dockerized
-.\deploy.ps1                   # interactive wizard
-openh                          # use it just like the native CLI ('oh' would collide with Out-Host)
-ohmo init
-```
+The mount blacklist (see [SECURITY.md](./SECURITY.md)) will refuse anything
+under `$HOME`, `/etc`, `/var`, the docker socket, etc. To intentionally
+expose part of your `$HOME`, copy or symlink the data into a separate
+directory first (e.g. `/data/`), then mount that.
 
-After deploy, the shims are installed to:
-- **\*nix:** `~/.local/bin/` (add it to `PATH` if not already)
-- **Windows:** `%USERPROFILE%\.openharness-docker\bin\` (add to PATH, or
-  dot-source the generated `profile.ps1` from your `$PROFILE`)
+## How `oh` finds your code
 
-## Command cheatsheet
+When you run `oh` (or `openh` on Windows), the shim figures out where your
+host CWD is exposed inside the container:
 
-| Command                                            | What it does                                              |
-| -------------------------------------------------- | --------------------------------------------------------- |
-| `oh ...` (\*nix) / `openh ...` (PS)                | Forward to the default container; cwd mirrors the host    |
-| `ohmo ...`                                         | Forward `ohmo` to the default container                   |
-| `oh-ctl list`                                      | List instances, mark the default with `*`                 |
-| `oh-ctl set-default NAME`                          | Set `NAME` as the default instance                        |
-| `oh-ctl exec NAME -- <cmd...>`                     | Run something inside a specific instance                  |
-| `oh-ctl status [NAME]`                             | Container health (all instances or just one)              |
-| `oh-ctl restart [NAME]`                            | Restart an instance (default if omitted)                  |
-| `oh-ctl logs [NAME] [-f]`                          | Tail container logs                                       |
-| `oh-ctl shell [NAME]`                              | Interactive bash inside the container                     |
-| `oh-ctl rm NAME [--purge]`                         | Remove a container (`--purge` also wipes metadata)        |
-| `oh --oh-instance NAME ...`                        | One-shot override of the default instance                 |
-| `OH_INSTANCE=NAME oh ...`                          | Same, via environment variable                            |
+| You are at host path…                  | The shim does…                                          |
+| -------------------------------------- | ------------------------------------------------------- |
+| `/data/proj` (already mounted at `/work/proj`) | runs `oh` inside the long-lived container with `cwd=/work/proj` |
+| `/some/other/safe/path` (not mounted)  | asks `Mount it for this command? [y/N]` (default N)     |
+| answer `y`                             | spawns a one-shot `docker run --rm` with the same hardening **plus** that single mount |
+| answer `n`, or non-interactive shell   | runs from `/oh-home` and warns that the agent can't see your cwd |
+| `/etc`, `~/.ssh`, etc. (blacklisted)   | refuses to mount, runs from `/oh-home` instead          |
 
-## Maintenance scripts
+To skip the prompt set `OH_AUTO_MOUNT_CWD=1` (auto-yes) or `=0` (auto-no).
+Default is interactive; **non-interactive shells default to no**.
 
-| *nix              | PowerShell        | Purpose                                                |
-| ----------------- | ----------------- | ------------------------------------------------------ |
-| `deploy.sh`         | `deploy.ps1`         | Deploy a new instance, or redeploy an existing one     |
-| `status.sh`         | `status.ps1`         | Alias for `oh-ctl status`                              |
-| `restart.sh`        | `restart.ps1`        | Alias for `oh-ctl restart`                             |
-| `update-oh.sh`      | `update-oh.ps1`      | Rebuild the OH runtime image and recreate containers   |
-| `update-deployer.sh`| `update-deployer.ps1`| Update this wrapper repo itself (`git pull --ff-only`) |
-| `uninstall.sh`      | `uninstall.ps1`      | Remove containers and shims (keeps your user data)     |
-
-## How file mounting works
-
-Mount points inside the container:
-
-| Platform              | Host path        | Container path           |
-| --------------------- | ---------------- | ------------------------ |
-| macOS / Linux / WSL   | `$HOME`          | `$HOME` (identical)      |
-| Windows PowerShell    | `C:\Users\you`   | `/mnt/c/Users/you`       |
-
-Because the container path always corresponds 1:1 to the host path, `oh` run
-from any mounted directory behaves the same as it would natively.
-
-### Three things, three boundaries
-
-This project deliberately keeps three things separate:
-
-| #   | Lives at                                                                | What is it?                                            | Container access                       |
-| --- | ----------------------------------------------------------------------- | ------------------------------------------------------ | -------------------------------------- |
-| 1.  | The **wrapper repo** (this repo: `deploy.sh`, `Dockerfile`, …)          | The plumbing you `git pull` / `git push` to update    | **No access.** Shadowed if it falls inside a bind-mount |
-| 2.  | The **OpenHarness source** (`openharness-ai` from PyPI)                 | The actual `oh` / `ohmo` runtime                       | Lives **only inside the image**; never on host         |
-| 3.  | Your **workspace** (your projects under `$HOME`, anywhere else you mount) | Where `oh` reads/writes when you use it                | Full read/write — that's the whole point |
-
-In other words:
-
-- `git pull` on this wrapper repo **cannot** affect a running container.
-  Containers don't see the repo at all (and even if you cloned it under
-  `$HOME`, the repo path is shadowed inside the container — see below).
-- An `oh` agent inside the container **cannot** modify the wrapper repo,
-  the Dockerfile, or your `~/.openharness-docker` state. It would see
-  empty directories there and any writes would land in throwaway
-  in-memory storage.
-- Upgrading OpenHarness only happens when you explicitly run `update-oh.sh`
-  / `update-oh.ps1` (which rebuilds the image from `pip install`).
-  Updating this wrapper repo itself is a separate command:
-  `update-deployer.sh` / `update-deployer.ps1`.
-
-### Per-instance state isolation
-
-Each instance also has its own copy of OpenHarness's user state — the
-provider profile (your OpenRouter key, default model), the ohmo soul /
-identity / memory, skills, etc. They live on the host at:
-
-```
-~/.openharness-instances/<instance-name>/
-├── openharness/      → bind-mounted as ~/.openharness inside the container
-└── ohmo/             → bind-mounted as ~/.ohmo       inside the container
-```
-
-So if you deploy:
+## Multiple instances
 
 ```bash
-./deploy.sh --name oh-work     --model anthropic/claude-3.5-sonnet
-./deploy.sh --name oh-personal --model openai/gpt-4o-mini
+./deploy.sh --name work
+./deploy.sh --name personal --mount /data/personal
+oh-ctl list
+oh-ctl set-default personal
+OH_INSTANCE=work oh -p "..."
 ```
 
-…the second deploy does **not** clobber the first one's settings.
-`oh-work` keeps using claude-3.5-sonnet, `oh-personal` uses gpt-4o-mini,
-and their ohmo memories never bleed into each other. Your project files
-under `$HOME`, on the other hand, **are** still shared (because both
-agents need to be able to edit your code — that's the whole point).
+Each instance has its own:
 
-`oh-ctl rm <name> --purge` removes both the container and that instance's
-per-instance state directory.
+- container (`oh-<name>`)
+- HOME named volume (`oh-<name>-home`)
+- mount list (in `~/.openharness-docker/config.json`)
+- model selection / OpenRouter key
 
-### Isolation guard ("shadow mounts")
+State does **not** bleed between instances.
 
-If the wrapper repo path or `~/.openharness-docker` happens to fall
-**inside** an attached bind-mount (typical case: you cloned this repo
-under `$HOME`), the deploy wizard automatically overlays a small
-`tmpfs` at the same in-container path. The container then sees an empty
-directory there, and any writes go into the tmpfs (gone when the
-container is removed). Your real wrapper-repo files on the host are
-never touched.
-
-You'll see this in the deploy output:
-
-```
-[i] Wrapper repo is inside a bind-mount; shadowing it inside the container
-    so 'oh' cannot touch it: /home/you/oh-wrapper
-[i] Wrapper state dir will be shadowed inside the container:
-    /home/you/.openharness-docker
-```
-
-### What if my project is outside the mounted area?
-
-(Typical on Windows when your code lives on `D:\` but only `C:\Users\you` is
-mounted.) The shim won't let `docker` blow up with a cryptic error. It probes
-whether your `cwd` is visible inside the container and, if not, falls back to
-the instance's home with a friendly warning:
-
-```
-[!] Path not visible inside container 'oh-default':
-[!]     host cwd : D:\Projects\foo
-[!]     expected : /mnt/d/Projects/foo
-[!] Falling back to: /mnt/c/Users/you
-[!] Tip: redeploy with  -ExtraMount 'D:\Projects\foo'  to add this path to the container.
-```
-
-To fix it, redeploy with the extra path mounted:
+## Updating, restarting, removing
 
 ```bash
-# *nix
-./deploy.sh --name oh-default --extra-mount /opt/projects
-# PowerShell
-.\deploy.ps1 -Name oh-default -ExtraMount D:\Projects
+# Rebuild the image and recreate every container (preserves home volumes)
+./update-oh.sh
+.\update-oh.ps1
+
+# Pull the latest version of this wrapper repo
+./update-deployer.sh
+.\update-deployer.ps1
+
+# Restart / status
+./restart.sh [name]
+./status.sh
+
+# Remove the container only (keep state and image):
+oh-ctl rm <name>
+# Remove everything for one instance, including the HOME volume:
+oh-ctl rm <name> --purge
+
+# Wholesale uninstall:
+./uninstall.sh                 # containers + shims, keep volumes + image
+./uninstall.sh --volumes       # also wipe home volumes (DESTROYS state)
+./uninstall.sh --all           # everything: containers + volumes + image + metadata + shims
 ```
 
-## Multi-instance & default selection
-
-1. The first instance you deploy is **automatically set as the default**.
-2. Subsequent deploys **ask** whether to take over as the new default. Force
-   the choice with `--set-default` / `--no-default` (or `-SetDefault` /
-   `-NoDefault` in PowerShell).
-3. When you type `oh ...` the shim picks the target instance in this order:
-   - `OH_INSTANCE` env var, or `--oh-instance NAME` on the command line
-   - Otherwise the saved `default_instance` in `~/.openharness-docker/config.json`
-   - Otherwise the only deployed instance (if there's exactly one)
-   - Otherwise it errors and prints a helpful list
-4. `oh-ctl list` marks the current default with `*`.
-
-## Layout on disk
+## Files in this repo
 
 ```
-~/.openharness-docker/             (Windows: %USERPROFILE%\.openharness-docker\)
-├── config.json                    # default_instance + per-instance metadata
-├── instances/<name>/              # reserved for per-instance scratch files
-├── bin/                           # (Windows) installed shim scripts
-└── profile.ps1                    # (Windows) helper functions for $PROFILE
+deploy.sh / deploy.ps1            interactive deploy wizard
+docker/Dockerfile                 hardened sandbox image
+docker/entrypoint.sh              container entrypoint (refuses to run as root)
+scripts/oh-ctl.sh, oh-ctl.ps1     instance + mount management
+scripts/install-shims.sh|.ps1     install oh / ohmo / openh / oh-ctl shims
+scripts/lib/common.sh             sh helpers (path blacklist, exec, …)
+scripts/lib/Common.psm1           ps1 mirror of common.sh
+scripts/lib/shim_template.sh|.ps1 template for the per-CLI forwarder shims
+update-oh.sh|.ps1                 rebuild image + recreate every instance
+update-deployer.sh|.ps1           git-pull this wrapper
+restart.sh|.ps1, status.sh|.ps1   thin oh-ctl wrappers
+uninstall.sh|.ps1                 cleanup
+SECURITY.md                       threat model, isolation contract, attack list
+docs/ARCHITECTURE.md              design rationale and trade-offs
+sandbox/redteam/                  red-team rig: agent + canaries + forensics
 ```
 
-Container naming convention: `oh-<instance-name>`. Every container we create
-carries the label `dev.openharness.dockerized=1` (plus
-`dev.openharness.instance=<name>`), so our scripts can filter on it and we
-never touch unrelated containers.
+## Red-team validation
 
-## Troubleshooting
+`sandbox/redteam/` contains an LLM-driven escape rig that runs **inside**
+the sandbox and tries to read host canary files. The current configuration
+has been validated against `claude-opus-4.7` (three rounds, all held;
+naïve and informed rounds ended with the model voluntarily giving up).
+See `SECURITY.md` for re-run instructions.
 
-### `openh` / `oh` is not found
-- **\*nix:** add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc.
-- **Windows:** add the shim dir to your user PATH:
-  ```powershell
-  [Environment]::SetEnvironmentVariable(
-      'Path',
-      "$HOME\.openharness-docker\bin;$([Environment]::GetEnvironmentVariable('Path','User'))",
-      'User')
-  ```
-  …and restart your shell.
+If you find a way to escape that the red-team didn't catch, please open a
+private security advisory.
 
-### `oh provider list` does not show OpenRouter
-Re-run the wizard for that instance — it will rewrite the provider profile:
-```bash
-./deploy.sh --name <instance>     # or  .\deploy.ps1 -Name <instance>
-```
+## FAQ
 
-### Can't reach the container / passthrough produces no output
-```bash
-oh-ctl status            # is the container running?
-oh-ctl logs              # entrypoint output
-oh-ctl shell             # poke around inside
-```
+**Q: This breaks my workflow — `oh` used to see all of `~`, now it sees nothing.**
+A: That was the bug. Use `oh-ctl mount add` for the directories you actually
+want the agent to read or write. The transparency you had previously was
+also being given to a process you don't control.
 
-### Full reset
-```bash
-./uninstall.sh --all      # PowerShell: .\uninstall.ps1 -All
-```
-This removes containers, the image, and the shims, but leaves your
-`~/.openharness` and `~/.ohmo` alone (your skills, memory and credentials).
+**Q: Can I just disable the sandbox / get the old behavior back?**
+A: No. There is no "share-home" mode. If you really want host-wide access for
+some reason (and you understand the consequences), fork this repo and add
+the bind mount yourself; please don't ask the maintainers to add the
+flag.
 
-## Design notes
+**Q: The agent inside can still read my OpenRouter key, right?**
+A: Yes. It has to, to call the LLM. Use a dedicated OpenRouter sub-key with a
+budget cap. See `SECURITY.md` § "Accepted residual risks".
 
-The repository is small. The interesting decisions are written up in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Highlights:
+**Q: Can the container talk to other services on my LAN?**
+A: Yes, through the Docker bridge, by default. If your host runs an
+unauthenticated Redis on `127.0.0.1`, the container can reach it via
+`172.17.0.1`. Pass `--no-network` (sh) / `-NoNetwork` (ps1) to deploy with
+`--network=none` if your workload doesn't need OpenRouter.
 
-- Bind-mount the user `$HOME` (or `C:\Users\you` ↔ `/mnt/c/Users/you` on
-  Windows) so the in-container path matches the host path exactly.
-- Bake one `ohuser` (UID 1000) into the image; resync its UID/GID at
-  container start to match `HOST_UID` / `HOST_GID`. This lets a single image
-  work for any host user, including `root` with UID 0 (typical inside WSL).
-- PowerShell quirk: functions capture external-command stdout into their
-  return pipeline. So the shim builds the `docker exec` argv inside a
-  function (`Get-OhdExecArgs`) and then runs `& docker @argv` at the **top
-  level**, ensuring stdout streams straight to the user's console.
+**Q: I'm on Windows. Why is `oh` aliased to `openh`?**
+A: Because PowerShell aliases the literal name `oh` to `Out-Host`, which
+shadows our shim and produces confusing errors. Use `openh` (or `openharness`)
+on Windows.
 
-## Contributing
+**Q: How do I expose a Windows path?**
+A: `oh-ctl mount add D:\Projects\Foo`. The shim translates Windows paths
+to Docker bind sources correctly. The path appears inside the container as
+`/work/Foo`.
 
-PRs and issues are welcome. Please:
-
-- Write **everything in English** (commits, PR descriptions, issues, code
-  comments).
-- Run an end-to-end deploy + shim test on the platform you're touching
-  before submitting. The README "Troubleshooting" section is a reasonable
-  smoke test.
-- Don't add a `# syntax=docker/dockerfile:1.6` line to the Dockerfile — it
-  forces BuildKit to fetch the frontend image, which breaks in
-  network-restricted environments. Stick with the default frontend.
-
-## License
-
-MIT, in the spirit of the upstream HKUDS/OpenHarness project. This wrapper
-includes none of its source code — only an installation recipe.
+**Q: What about Docker Desktop on macOS?**
+A: It works. The same blacklist applies. macOS users typically mount things
+like `/Users/me/code/proj`, which is **inside** `$HOME` and so will be
+**rejected** by the blacklist. Move or symlink it under `/Volumes/Code/` or
+similar, mount that.

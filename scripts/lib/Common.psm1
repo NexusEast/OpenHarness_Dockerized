@@ -1,6 +1,13 @@
-# OpenHarness Dockerized - shared PowerShell module.
-# Mirrors scripts/lib/common.sh.  Loaded by every .ps1 script:
+# OpenHarness Sandbox - shared PowerShell module.
+# Mirrors scripts/lib/common.sh. Loaded by every .ps1 script:
 #     Import-Module "$PSScriptRoot/lib/Common.psm1" -Force
+#
+# Security model: SANDBOX. The container has NO host filesystem access
+# except paths the user explicitly mounts via -Mount. This module provides
+# the path blacklist (Assert-OhdMountSafe), host->container path mapping
+# (Get-OhdContainerTargetFor), and the helpers used by oh-ctl / shims.
+#
+# Read SECURITY.md before changing anything in here.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -13,43 +20,10 @@ $script:OhdShimBinDir     = if ($env:OHD_SHIM_BIN_DIR) { $env:OHD_SHIM_BIN_DIR }
 $script:OhdImageDefault   = 'openharness-dockerized:latest'
 $script:OhdContainerPref  = 'oh-'
 $script:OhdLabel          = 'dev.openharness.dockerized=1'
-
-# ---------------- isolation helpers ----------------
-# The "wrapper repo" is THIS git repository (the directory containing
-# deploy.ps1, the Dockerfile, scripts/...). It must be fully isolated from
-# any container we spawn so that:
-#   * a container cannot read or modify our scripts/Dockerfile,
-#   * `git pull` on this repo cannot affect a running container,
-#   * the agent inside the container has no path back into our codebase.
-function Get-OhdWrapperRepoRoot {
-    # The module file lives at <repo>/scripts/lib/Common.psm1
-    return (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-}
-
-# Test whether $Child path lies inside $Parent path. Both must be absolute.
-function Test-OhdPathInside {
-    param([Parameter(Mandatory)][string]$Child, [Parameter(Mandatory)][string]$Parent)
-    $c = ([System.IO.Path]::GetFullPath($Child)).TrimEnd('\','/')
-    $p = ([System.IO.Path]::GetFullPath($Parent)).TrimEnd('\','/')
-    if ($c -eq $p) { return $true }
-    if ($IsWindows) {
-        return $c.ToLower().StartsWith($p.ToLower() + [System.IO.Path]::DirectorySeparatorChar)
-    } else {
-        return $c.StartsWith($p + '/')
-    }
-}
-
-function Get-OhdPaths {
-    [pscustomobject]@{
-        Home          = $script:OhdHome
-        Config        = $script:OhdConfig
-        InstancesDir  = $script:OhdInstancesDir
-        ShimBinDir    = $script:OhdShimBinDir
-        ImageDefault  = $script:OhdImageDefault
-        ContainerPref = $script:OhdContainerPref
-        Label         = $script:OhdLabel
-    }
-}
+$script:OhdLabelSandbox   = 'dev.openharness.sandbox=1'
+$script:OhdWorkPrefix     = '/work'
+$script:OhdSandboxUid     = 1000
+$script:OhdSandboxGid     = 1000
 
 # ---------------- logging ----------------
 function Write-OhdInfo  { param([string]$Msg) Write-Host "[i] $Msg" -ForegroundColor Cyan }
@@ -78,50 +52,150 @@ function Assert-OhdDocker {
         Write-OhdErr "'docker' CLI not found in PATH."
         Write-OhdInfo "Install Docker Desktop for Windows:"
         Write-OhdInfo "    https://www.docker.com/products/docker-desktop/"
-        Write-OhdInfo "After install, ensure 'docker' is on your PATH and the daemon is running."
         Stop-OhdDie  "docker CLI not found; aborting."
     }
     if (-not (Test-OhdDocker)) {
         Write-OhdErr "Docker daemon is not reachable."
-        Write-OhdInfo "Start Docker Desktop (Windows tray) and wait until it reports 'Engine running', then retry."
+        Write-OhdInfo "Start Docker Desktop and wait until 'Engine running'."
         Stop-OhdDie  "Docker daemon not reachable."
     }
 }
 
-# ---------------- WSL path translation ----------------
-# Convert a Windows path (e.g. D:\Foo\Bar) to its container-side path.
-# We use WSL's /mnt/<drive>/... convention because docker-desktop/wsl bind-mounts
-# Windows drives there.
-# Note: this function does NOT require the path to exist (so we can use it
-# for staged files we are about to write).
-function ConvertTo-OhdContainerPath {
-    param([Parameter(Mandatory)][string]$Path)
-    # Normalize to absolute Windows path without requiring existence.
-    if ($IsWindows) {
-        $full = [System.IO.Path]::GetFullPath($Path)
-        if ($full -match '^([A-Za-z]):[\\\/](.*)$') {
-            $drive = $Matches[1].ToLower()
-            $rest  = $Matches[2] -replace '\\','/'
-            return ("/mnt/$drive/$rest").TrimEnd('/')
-        } else {
-            # UNC or unusual path - try wsl.exe
-            $wsl = (& wsl.exe wslpath -u $full 2>$null) -join ''
-            if ($LASTEXITCODE -eq 0 -and $wsl) { return $wsl.Trim() }
-            Stop-OhdDie "Cannot translate path to a Linux path: $full"
-        }
-    }
-    # On *nix, container path == host path (we mount $HOME identically there)
-    return [System.IO.Path]::GetFullPath($Path)
+# ---------------- path helpers ----------------
+function Get-OhdWrapperRepoRoot {
+    return ([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')))
 }
 
-# Bind-mount source as Docker sees it.
-# IMPORTANT (verified empirically):
-#   * On Windows + Docker Desktop, the bind-mount SOURCE must be a Windows path
-#     (e.g. C:\Users\foo). If you pass /mnt/c/Users/foo as source, docker-desktop
-#     mounts the entire C: drive as ext4 and the container will NOT see your
-#     real Windows files.
-#   * The DESTINATION inside the container is what we use for cwd alignment, and
-#     we want it in Linux form (/mnt/c/Users/foo).
+# Canonicalise a path. GetFullPath does not require existence.
+function Resolve-OhdCanonicalPath {
+    param([Parameter(Mandatory)][string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $null }
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\','/')
+}
+
+function Test-OhdPathInside {
+    param([Parameter(Mandatory)][string]$Child, [Parameter(Mandatory)][string]$Parent)
+    $c = (Resolve-OhdCanonicalPath $Child)
+    $p = (Resolve-OhdCanonicalPath $Parent)
+    if ([string]::IsNullOrEmpty($p)) { $p = '/' }
+    if ($c -eq $p) { return $true }
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    if ($IsWindows) {
+        return $c.ToLower().StartsWith($p.ToLower() + $sep)
+    } else {
+        return $c.StartsWith($p + '/')
+    }
+}
+
+# Build the list of host paths that must NEVER be exposed inside a sandbox.
+function Get-OhdSensitivePaths {
+    $paths = @(
+        '/'
+        '/root', '/home', '/etc', '/var', '/usr', '/boot',
+        '/sys', '/proc', '/dev', '/run', '/lib', '/lib64',
+        '/sbin', '/bin', '/srv', '/opt'
+        '/var/run/docker.sock', '/run/docker.sock',
+        '/var/run/containerd', '/run/containerd',
+        '/var/lib/docker', '/var/lib/containerd', '/var/lib/kubelet',
+        '/mnt/wsl'
+    )
+    if ($IsWindows) {
+        # Windows-side sensitive locations (when -Mount receives a Windows path).
+        # These are case-insensitive prefixes.
+        $sysroot = [Environment]::GetFolderPath('Windows')                       # C:\Windows
+        $sysdrive = [Environment]::GetEnvironmentVariable('SystemDrive')         # C:
+        $progFiles  = [Environment]::GetFolderPath('ProgramFiles')               # C:\Program Files
+        $progFiles86= [Environment]::GetFolderPath('ProgramFilesX86')            # C:\Program Files (x86)
+        $userProf   = [Environment]::GetFolderPath('UserProfile')                # C:\Users\foo
+        $appData    = [Environment]::GetFolderPath('ApplicationData')            # roaming
+        $localApp   = [Environment]::GetFolderPath('LocalApplicationData')
+        $usersRoot  = if ($sysdrive) { Join-Path $sysdrive '\Users' } else { '' }
+        $paths += @(
+            $sysroot, $progFiles, $progFiles86, $usersRoot,
+            $userProf,
+            (Join-Path $userProf '.ssh'),
+            (Join-Path $userProf '.aws'),
+            (Join-Path $userProf '.azure'),
+            (Join-Path $userProf '.gcloud'),
+            (Join-Path $userProf '.docker'),
+            (Join-Path $userProf '.kube'),
+            (Join-Path $userProf '.gnupg'),
+            (Join-Path $userProf '.openharness'),
+            (Join-Path $userProf '.openharness-docker'),
+            $appData, $localApp
+        ) | Where-Object { $_ }
+    } else {
+        if ($HOME) {
+            $paths += @(
+                $HOME,
+                (Join-Path $HOME '.ssh'),
+                (Join-Path $HOME '.aws'),
+                (Join-Path $HOME '.azure'),
+                (Join-Path $HOME '.gcloud'),
+                (Join-Path $HOME '.docker'),
+                (Join-Path $HOME '.kube'),
+                (Join-Path $HOME '.gnupg'),
+                (Join-Path $HOME '.config'),
+                (Join-Path $HOME '.netrc'),
+                (Join-Path $HOME '.openharness'),
+                (Join-Path $HOME '.openharness-docker'),
+                (Join-Path $HOME '.openharness-instances'),
+                (Join-Path $HOME '.bash_history'),
+                (Join-Path $HOME '.zsh_history')
+            )
+        }
+    }
+    # Wrapper repo: the agent must not modify the scripts that run it.
+    $wrapper = (Get-OhdWrapperRepoRoot)
+    if ($wrapper) { $paths += $wrapper }
+    return ,$paths
+}
+
+# Hard-fail if a host path requested for mount is unsafe. Mirrors
+# scripts/lib/common.sh::ohd_assert_mount_safe.
+function Assert-OhdMountSafe {
+    param([Parameter(Mandatory)][string]$Path)
+    $cpath = Resolve-OhdCanonicalPath $Path
+    if (-not $cpath) { Stop-OhdDie "cannot canonicalise mount path: $Path" }
+    if ($cpath -eq '/' -or $cpath -match '^[A-Za-z]:\\?$') {
+        Stop-OhdDie "refusing to mount a filesystem root: $Path"
+    }
+    # Symlink check. Also reject reparse points on Windows.
+    $item = $null
+    try { $item = Get-Item -LiteralPath $cpath -Force -ErrorAction Stop } catch { $item = $null }
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Stop-OhdDie "mount '$Path' is a symlink/reparse-point; pass the resolved real target after re-checking it."
+    }
+    if ($item -and -not $item.PSIsContainer) {
+        Stop-OhdDie "mount '$Path' is not a directory; refusing."
+    }
+    foreach ($s in (Get-OhdSensitivePaths)) {
+        if (-not $s) { continue }
+        if (Test-OhdPathInside -Child $cpath -Parent $s) {
+            Stop-OhdDie "mount '$Path' (canonical '$cpath') is inside or equal to sensitive path '$s'; refusing. See SECURITY.md."
+        }
+        if (Test-OhdPathInside -Child $s -Parent $cpath) {
+            Stop-OhdDie "mount '$Path' (canonical '$cpath') would expose sensitive path '$s'; refusing. See SECURITY.md."
+        }
+    }
+}
+
+# Map a host path to an in-container target /work/<basename>.
+function Get-OhdContainerTargetFor {
+    param([Parameter(Mandatory)][string]$HostPath, [string]$Suffix = '')
+    $base = Split-Path -Leaf $HostPath
+    if ([string]::IsNullOrEmpty($base)) { $base = 'root' }
+    $base = ($base -replace '[^A-Za-z0-9._-]','_')
+    if ($Suffix) {
+        return "$script:OhdWorkPrefix/$base-$Suffix"
+    } else {
+        return "$script:OhdWorkPrefix/$base"
+    }
+}
+
+# Convert a Windows path into the form Docker accepts as bind-mount source.
+# IMPORTANT: on Docker Desktop, source must be the *Windows* path
+# (C:\Users\foo), NOT the WSL form (/mnt/c/Users/foo).
 function Get-OhdMountSource {
     param([Parameter(Mandatory)][string]$Path)
     return [System.IO.Path]::GetFullPath($Path)
@@ -132,7 +206,7 @@ function Initialize-OhdConfig {
     if (-not (Test-Path $script:OhdHome))         { New-Item -ItemType Directory -Path $script:OhdHome -Force | Out-Null }
     if (-not (Test-Path $script:OhdInstancesDir)) { New-Item -ItemType Directory -Path $script:OhdInstancesDir -Force | Out-Null }
     if (-not (Test-Path $script:OhdConfig)) {
-        @{ version=1; default_instance=$null; instances=@{} } | ConvertTo-Json -Depth 10 | Set-Content -Path $script:OhdConfig -Encoding UTF8
+        @{ version=2; default_instance=$null; instances=@{} } | ConvertTo-Json -Depth 10 | Set-Content -Path $script:OhdConfig -Encoding UTF8
     }
 }
 
@@ -192,6 +266,38 @@ function Set-OhdInstance {
     Save-OhdConfig $cfg
 }
 
+function Get-OhdInstanceMounts {
+    param([Parameter(Mandatory)][string]$Name)
+    $inst = Get-OhdInstance $Name
+    if (-not $inst) { return @() }
+    if (-not $inst.ContainsKey('mounts') -or $null -eq $inst.mounts) { return @() }
+    return @($inst.mounts)
+}
+
+function Set-OhdInstanceMounts {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Mounts
+    )
+    $cfg = Get-OhdConfig
+    if (-not $cfg.instances) { $cfg.instances = @{} }
+    if (-not $cfg.instances.ContainsKey($Name)) { $cfg.instances[$Name] = @{} }
+    $cfg.instances[$Name].mounts = $Mounts
+    Save-OhdConfig $cfg
+}
+
+function Add-OhdInstanceMount {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$HostPath,
+        [Parameter(Mandatory)][string]$Target,
+        [bool]$ReadOnly = $false
+    )
+    $existing = @(Get-OhdInstanceMounts $Name)
+    $entry = @{ host = $HostPath; target = $Target; readonly = $ReadOnly }
+    Set-OhdInstanceMounts -Name $Name -Mounts ($existing + $entry)
+}
+
 function Remove-OhdInstance {
     param([Parameter(Mandatory)][string]$Name)
     $cfg = Get-OhdConfig
@@ -204,6 +310,11 @@ function Remove-OhdInstance {
 function Get-OhdContainerName {
     param([Parameter(Mandatory)][string]$Name)
     return "$script:OhdContainerPref$Name"
+}
+
+function Get-OhdHomeVolumeName {
+    param([Parameter(Mandatory)][string]$Name)
+    return "oh-$Name-home"
 }
 
 function Test-OhdContainerRunning {
@@ -221,12 +332,10 @@ function Test-OhdContainerExists {
 # ---------------- instance resolution ----------------
 function Resolve-OhdInstance {
     param([string]$Explicit)
-
     if ($Explicit) { return $Explicit }
     if ($env:OH_INSTANCE) { return $env:OH_INSTANCE }
     $d = Get-OhdDefaultInstance
     if ($d -and (Test-OhdInstance $d)) { return $d }
-
     $names = @(Get-OhdInstanceNames)
     if ($names.Count -eq 1) { return $names[0] }
     if ($names.Count -eq 0) {
@@ -240,11 +349,59 @@ function Resolve-OhdInstance {
     return $null
 }
 
-# ---------------- exec ----------------
-# Build the docker exec argv that the caller should run as `& docker @args`.
-# We build but do NOT execute, so that stdout/stderr stream directly to the
-# caller's console (PowerShell functions otherwise capture stdout into the
-# return pipeline).
+# Given an instance and a host path, return the in-container path the agent
+# would see it at, or $null if not in any of the instance's mounts.
+function Resolve-OhdHostPathToContainer {
+    param(
+        [Parameter(Mandatory)][string]$Instance,
+        [Parameter(Mandatory)][string]$HostPath
+    )
+    if (-not $HostPath) { return $null }
+    $cpath = Resolve-OhdCanonicalPath $HostPath
+    $best = $null
+    foreach ($m in (Get-OhdInstanceMounts $Instance)) {
+        $mhost = $m.host
+        if (-not $mhost) { continue }
+        if (Test-OhdPathInside -Child $cpath -Parent $mhost) {
+            if (-not $best -or $mhost.Length -gt $best.host.Length) {
+                $best = $m
+            }
+        }
+    }
+    if (-not $best) { return $null }
+    $rel = $cpath.Substring($best.host.Length).TrimStart('\','/')
+    if (-not $rel) { return $best.target }
+    # Always emit a Linux-style path (slashes) for the container.
+    $rel = $rel -replace '\\','/'
+    return ("$($best.target)/$rel")
+}
+
+function Confirm-OhdCwdMount {
+    param([Parameter(Mandatory)][string]$HostPath)
+    switch ($env:OH_AUTO_MOUNT_CWD) {
+        { $_ -in '1','y','Y','yes','YES' } { Write-OhdInfo "OH_AUTO_MOUNT_CWD=1 -> mounting $HostPath"; return $true }
+        { $_ -in '0','n','N','no','NO' }   { Write-OhdInfo "OH_AUTO_MOUNT_CWD=0 -> NOT mounting $HostPath"; return $false }
+    }
+    $tty = $false
+    try { $tty = (-not [Console]::IsInputRedirected) -and (-not [Console]::IsOutputRedirected) } catch { $tty = $false }
+    if (-not $tty) {
+        Write-OhdWarn "Non-interactive shell; refusing to auto-mount '$HostPath'."
+        Write-OhdWarn "Set OH_AUTO_MOUNT_CWD=1 to allow, or pre-add it via:  oh-ctl mount add $HostPath"
+        return $false
+    }
+    Write-Host ""
+    Write-OhdWarn "About to expose host path inside the sandbox:"
+    Write-OhdWarn "    $HostPath"
+    Write-OhdWarn "The agent will be able to read AND WRITE everything under it."
+    Write-OhdWarn "If this contains secrets, credentials or anything you wouldn't paste"
+    Write-OhdWarn "into a public chat, answer 'n' and run from a different directory."
+    $ans = Read-Host "? Mount it for this command? [y/N]"
+    return ($ans -match '^(y|Y|yes|YES)$')
+}
+
+# Build the docker exec / docker run argv. The shim invokes
+# `& docker @argv` at top level so output streams stay attached to the
+# user's console.
 function Get-OhdExecArgs {
     [CmdletBinding()]
     param(
@@ -253,6 +410,10 @@ function Get-OhdExecArgs {
         [Parameter()][string[]]$Arguments = @()
     )
     $cname = Get-OhdContainerName $Instance
+    $home_vol = Get-OhdHomeVolumeName $Instance
+    $inst = Get-OhdInstance $Instance
+    $image = if ($inst -and $inst.image) { $inst.image } else { $script:OhdImageDefault }
+
     if (-not (Test-OhdContainerRunning $cname)) {
         if (Test-OhdContainerExists $cname) {
             Write-OhdInfo "Instance '$Instance' is stopped. Starting..."
@@ -262,43 +423,81 @@ function Get-OhdExecArgs {
             Stop-OhdDie "Instance '$Instance' has no container. Run deploy.ps1"
         }
     }
-    $cwd = (Get-Location).ProviderPath
-    $cwdInContainer = ConvertTo-OhdContainerPath -Path $cwd
-
-    # Probe path visibility; gracefully fall back to host_home with a warning.
-    & docker exec $cname test -d $cwdInContainer 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        $inst = Get-OhdInstance $Instance
-        $fallback = if ($inst -and $inst.host_home) { $inst.host_home } else { '/' }
-        Write-OhdWarn "Path not visible inside container '$Instance':"
-        Write-OhdWarn "    host cwd : $cwd"
-        Write-OhdWarn "    expected : $cwdInContainer"
-        Write-OhdWarn "Falling back to: $fallback"
-        Write-OhdWarn "Tip: redeploy with  -ExtraMount '$cwd'  to add this path to the container."
-        $cwdInContainer = $fallback
-    }
 
     $tty = $false
-    try {
-        $tty = (-not [Console]::IsInputRedirected) -and (-not [Console]::IsOutputRedirected)
-    } catch { $tty = $false }
+    try { $tty = (-not [Console]::IsInputRedirected) -and (-not [Console]::IsOutputRedirected) } catch { $tty = $false }
     $ttyFlag = if ($tty) { '-it' } else { '-i' }
 
+    # Host CWD: PowerShell paths are Windows on Windows.
+    $hostCwd = (Get-Location).ProviderPath
+    $hostCwdCanonical = Resolve-OhdCanonicalPath $hostCwd
+    $cwdInContainer = Resolve-OhdHostPathToContainer -Instance $Instance -HostPath $hostCwdCanonical
+
+    if ($cwdInContainer) {
+        # CWD inside an existing mount: long-lived container.
+        $argv = @(
+            'exec', $ttyFlag,
+            '-e', "OH_INSTANCE=$Instance",
+            '-e', "TERM=$(if ($env:TERM) { $env:TERM } else { 'xterm-256color' })",
+            '-w', $cwdInContainer,
+            $cname,
+            'oh-entrypoint','exec','--',$TargetCli
+        ) + $Arguments
+        return ,$argv
+    }
+
+    # CWD not in any mount. Try to add ephemerally.
+    $safe = $true
+    try { Assert-OhdMountSafe -Path $hostCwdCanonical } catch { $safe = $false }
+    if ($safe -and (Confirm-OhdCwdMount -HostPath $hostCwdCanonical)) {
+        $target = Get-OhdContainerTargetFor -HostPath $hostCwdCanonical
+        $mountSrc = Get-OhdMountSource $hostCwdCanonical
+        $argv = @(
+            'run','--rm',$ttyFlag,
+            '--label',$script:OhdLabel,
+            '--label',$script:OhdLabelSandbox,
+            '--label',"dev.openharness.instance=$Instance",
+            '--label','dev.openharness.ephemeral=1',
+            '--user',"$script:OhdSandboxUid`:$script:OhdSandboxGid",
+            '--read-only',
+            '--tmpfs','/tmp:size=512m,mode=1777,nosuid,nodev,noexec',
+            '--tmpfs','/run:size=64m,mode=755,nosuid,nodev,noexec',
+            '-v',"$home_vol`:/oh-home",
+            '--cap-drop=ALL',
+            '--security-opt=no-new-privileges:true',
+            '--pids-limit','512',
+            '--memory','4g',
+            '--cpus','2',
+            '--add-host','metadata.google.internal:127.0.0.1',
+            '--add-host','metadata.tencentyun.com:127.0.0.1',
+            '--add-host','metadata.aliyuncs.com:127.0.0.1',
+            '--add-host','metadata.azure.com:127.0.0.1',
+            '--add-host','169.254.169.254:127.0.0.1',
+            '-e',"HOME=/oh-home",
+            '-e',"OH_INSTANCE=$Instance",
+            '-e',"TERM=$(if ($env:TERM) { $env:TERM } else { 'xterm-256color' })",
+            '-w',$target,
+            "--mount=type=bind,source=$mountSrc,target=$target,bind-recursive=disabled",
+            $image,
+            'oh-entrypoint','exec','--',$TargetCli
+        ) + $Arguments
+        return ,$argv
+    }
+
+    # Fall back to /oh-home with a warning.
+    Write-OhdWarn "Running '$TargetCli' from /oh-home; the agent cannot see your host cwd ($hostCwd)."
+    Write-OhdWarn "To make a host directory available, run:  oh-ctl mount add <host_path>"
     $argv = @(
         'exec', $ttyFlag,
         '-e', "OH_INSTANCE=$Instance",
         '-e', "TERM=$(if ($env:TERM) { $env:TERM } else { 'xterm-256color' })",
-        '-w', $cwdInContainer,
+        '-w', '/oh-home',
         $cname,
-        'oh-entrypoint', 'exec', '--', $TargetCli
-    )
-    $argv += $Arguments
-    return ,$argv     # comma-prefix prevents PowerShell unrolling the array
+        'oh-entrypoint','exec','--',$TargetCli
+    ) + $Arguments
+    return ,$argv
 }
 
-# Convenience wrapper for callers that don't care about streaming output
-# (e.g. when they pipe / capture). Most shims should call Get-OhdExecArgs and
-# invoke docker themselves.
 function Invoke-OhdExec {
     [CmdletBinding()]
     param(
