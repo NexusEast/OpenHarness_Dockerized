@@ -88,15 +88,273 @@ ohd_require_cmd() {
 }
 
 ohd_require_docker() {
-    ohd_require_cmd docker
+    ohd_ensure_docker
     docker info >/dev/null 2>&1 || die "Docker daemon is not reachable. Start Docker first."
 }
 
-# ---------------- jq helper (with fallback) ----------------
-# We require jq for clarity. If absent, error early.
-ohd_require_jq() {
-    command -v jq >/dev/null 2>&1 || die "'jq' is required. Install with: brew install jq / apt-get install jq"
+# ---------------- dependency installer ----------------
+# Strategy:
+#   - jq is small, ubiquitous, safe to auto-install.
+#   - docker is NOT auto-installed: rootful install touches systemd / cgroups /
+#     user groups / vendor repos; getting that wrong on a production VM is much
+#     worse than a clear error message. We just print the right command.
+#   - git is only needed for the self-update path; that path already degrades
+#     gracefully when git is missing.
+#
+# Honors:
+#   * --no-auto-install / -NoAutoInstall flag on deploy
+#   * OH_DEPLOYER_NO_AUTO_INSTALL=1 environment variable
+#   * non-interactive shells (auto-accept the install, just like self-update)
+
+# Detect the distro ID (from /etc/os-release). Examples:
+#   debian, ubuntu, raspbian, kali
+#   rhel, centos, rocky, almalinux, tencentos, fedora, ol, amzn
+#   alpine, arch, manjaro, opensuse-leap, opensuse-tumbleweed
+#   darwin, ""(unknown)
+ohd_detect_distro_id() {
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+        echo darwin; return
+    fi
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        ( . /etc/os-release; printf '%s\n' "${ID:-}" )
+        return
+    fi
+    echo ""
 }
+
+# Detect the system package manager. Echoes one of: apt | dnf | yum | apk |
+# pacman | zypper | brew | "" (none recognised).
+ohd_detect_pkg_manager() {
+    if   command -v apt-get >/dev/null 2>&1; then echo apt
+    elif command -v dnf     >/dev/null 2>&1; then echo dnf
+    elif command -v yum     >/dev/null 2>&1; then echo yum
+    elif command -v apk     >/dev/null 2>&1; then echo apk
+    elif command -v pacman  >/dev/null 2>&1; then echo pacman
+    elif command -v zypper  >/dev/null 2>&1; then echo zypper
+    elif command -v brew    >/dev/null 2>&1; then echo brew
+    else echo ""
+    fi
+}
+
+# Return the install command (as a single shell string) for the given pkg
+# manager and package name. Empty string if unknown.
+ohd_pkg_install_cmd() {
+    local pm="$1" pkg="$2"
+    case "$pm" in
+        apt)    echo "apt-get update -qq && apt-get install -y $pkg" ;;
+        dnf)    echo "dnf install -y $pkg" ;;
+        yum)    echo "yum install -y $pkg" ;;
+        apk)    echo "apk add --no-cache $pkg" ;;
+        pacman) echo "pacman -Sy --noconfirm $pkg" ;;
+        zypper) echo "zypper --non-interactive install $pkg" ;;
+        brew)   echo "brew install $pkg" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Decide whether the deployer is permitted to auto-install (asks the user when
+# interactive). Returns 0 = go ahead, 1 = do not install.
+#
+# Supports a "yes for all" mode: when the user picks [a] at any prompt, we set
+# OHD_ASSUME_YES_ALL=1 for the rest of this process; subsequent dependencies
+# install without re-prompting.
+ohd_auto_install_allowed() {
+    local pkg="$1"   # for the prompt message
+    [ "${OH_DEPLOYER_NO_AUTO_INSTALL:-0}" = "1" ] && return 1
+    [ "${OHD_NO_AUTO_INSTALL:-0}"          = "1" ] && return 1
+    [ "${OHD_ASSUME_YES_ALL:-0}"           = "1" ] && {
+        info "Auto-install '$pkg' (yes-for-all enabled)."
+        return 0
+    }
+    if [ -t 0 ] && [ -t 1 ]; then
+        local ans=""
+        printf "? Install missing dependency '%s' now? [Y]es / [n]o / [a]ll (yes for the rest): " "$pkg"
+        read -r ans || ans=""
+        case "${ans:-Y}" in
+            n|N|no|NO)         return 1 ;;
+            a|A|all|ALL)
+                export OHD_ASSUME_YES_ALL=1
+                info "yes-for-all enabled: future missing deps will install without prompting."
+                return 0 ;;
+            *)                 return 0 ;;
+        esac
+    else
+        info "Non-interactive shell; auto-accepting install of '$pkg'."
+    fi
+    return 0
+}
+
+# Run a privileged shell command; uses sudo when not already root.
+ohd_run_privileged() {
+    local cmd="$1"
+    if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+        bash -c "$cmd"
+    elif command -v sudo >/dev/null 2>&1; then
+        info "Running: sudo $cmd"
+        sudo bash -c "$cmd"
+    else
+        err "This step needs root, but neither root nor sudo is available."
+        return 1
+    fi
+}
+
+# Ensure jq is installed. Tries auto-install when allowed; otherwise prints the
+# exact command for the detected platform and exits.
+ohd_ensure_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+
+    local pm cmd distro
+    pm="$(ohd_detect_pkg_manager)"
+    distro="$(ohd_detect_distro_id)"
+    cmd="$(ohd_pkg_install_cmd "$pm" jq)"
+
+    if [ -z "$cmd" ]; then
+        err "'jq' is required but no supported package manager was found."
+        info "Detected distro: ${distro:-unknown}"
+        info "Install jq manually for your platform, then re-run ./deploy.sh."
+        info "  See https://jqlang.org/download/"
+        exit 1
+    fi
+
+    warn "'jq' is required but not installed."
+    info "Detected distro: ${distro:-unknown}   package manager: $pm"
+    info "Would run: $cmd"
+
+    if ohd_auto_install_allowed jq; then
+        if ohd_run_privileged "$cmd"; then
+            command -v jq >/dev/null 2>&1 \
+                && { ok "jq installed: $(jq --version 2>/dev/null || echo unknown)"; return 0; }
+            die "jq install reported success but jq is still not on PATH."
+        else
+            die "Auto-install of jq failed. Run manually: $cmd"
+        fi
+    else
+        info "Skipping auto-install. Install jq manually:"
+        info "    $cmd"
+        info "Then re-run ./deploy.sh."
+        exit 1
+    fi
+}
+
+# Ensure docker is present. Tries to install when the user agrees; the
+# install command set is distro-specific.
+ohd_ensure_docker() {
+    command -v docker >/dev/null 2>&1 && return 0
+
+    local pm distro
+    pm="$(ohd_detect_pkg_manager)"
+    distro="$(ohd_detect_distro_id)"
+
+    warn "'docker' CLI is required but not installed."
+    info "Detected distro: ${distro:-unknown}   package manager: ${pm:-unknown}"
+
+    # Build a list of install steps for the prompt. Each step is a single shell
+    # command that 'ohd_run_privileged' will execute (root or via sudo).
+    local steps=() post_hint=""
+    case "$pm" in
+        apt)
+            steps=(
+                "apt-get update -qq"
+                "apt-get install -y ca-certificates curl gnupg"
+                "install -m 0755 -d /etc/apt/keyrings"
+                "curl -fsSL https://download.docker.com/linux/${distro:-debian}/gpg -o /etc/apt/keyrings/docker.asc || curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc"
+                "chmod a+r /etc/apt/keyrings/docker.asc"
+                "echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${distro:-debian} \$(. /etc/os-release && echo \\\"\${VERSION_CODENAME:-bookworm}\\\") stable\" > /etc/apt/sources.list.d/docker.list"
+                "apt-get update -qq"
+                "apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+                "systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true"
+            )
+            post_hint="If your user is not root, run:  sudo usermod -aG docker \"\$USER\"   and re-login."
+            ;;
+        dnf|yum)
+            # For Amazon Linux 2/2023 'amazon-linux-extras' / 'dnf install docker' works too,
+            # but the Docker CE repo path is the most universally-correct way.
+            local family="centos"
+            case "$distro" in
+                fedora) family="fedora" ;;
+                rhel|centos|rocky|almalinux|tencentos|ol|amzn) family="centos" ;;
+            esac
+            steps=(
+                "$pm -y install ${pm}-plugins-core 2>/dev/null || $pm -y install yum-utils"
+                "$pm config-manager --add-repo https://download.docker.com/linux/$family/docker-ce.repo"
+                "$pm install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+                "systemctl enable --now docker"
+            )
+            post_hint="If your user is not root, run:  sudo usermod -aG docker \"\$USER\"   and re-login."
+            ;;
+        apk)
+            steps=(
+                "apk add --no-cache docker docker-cli docker-compose"
+                "rc-update add docker default"
+                "service docker start"
+            )
+            post_hint="If your user is not root, add it to the docker group:  addgroup \"\$USER\" docker   then re-login."
+            ;;
+        pacman)
+            steps=(
+                "pacman -Sy --noconfirm docker docker-compose"
+                "systemctl enable --now docker"
+            )
+            post_hint="If your user is not root, run:  sudo usermod -aG docker \"\$USER\"   and re-login."
+            ;;
+        zypper)
+            steps=(
+                "zypper --non-interactive install docker docker-compose"
+                "systemctl enable --now docker"
+            )
+            post_hint="If your user is not root, run:  sudo usermod -aG docker \"\$USER\"   and re-login."
+            ;;
+        brew)
+            # macOS: brew cask installs the Desktop app; user must launch it.
+            err "Docker Desktop must be installed manually on macOS."
+            info "  brew install --cask docker"
+            info "After install, launch Docker.app once so the engine starts, then re-run ./deploy.sh."
+            exit 1
+            ;;
+        *)
+            err "No supported package manager detected; cannot auto-install docker."
+            info "Install Docker manually:  https://docs.docker.com/engine/install/"
+            exit 1
+            ;;
+    esac
+
+    # Show the user what we are about to run.
+    echo
+    info "Would run the following commands (as root) to install Docker:"
+    for s in "${steps[@]}"; do
+        info "    $s"
+    done
+    [ -n "$post_hint" ] && info "  Post-install: $post_hint"
+    echo
+    warn "Installing Docker touches systemd, repos and user groups; review the commands above."
+
+    if ohd_auto_install_allowed docker; then
+        local s rc=0
+        for s in "${steps[@]}"; do
+            if ! ohd_run_privileged "$s"; then
+                rc=$?
+                err "Step failed (exit $rc): $s"
+                info "Aborting docker install. Fix the issue and re-run ./deploy.sh, or install docker manually."
+                exit 1
+            fi
+        done
+        if command -v docker >/dev/null 2>&1; then
+            ok "Docker installed: $(docker --version 2>/dev/null || echo unknown)"
+            [ -n "$post_hint" ] && warn "$post_hint"
+            return 0
+        else
+            die "Docker install reported success but 'docker' is still not on PATH."
+        fi
+    else
+        info "Skipping auto-install. Run the steps above manually, or use the official docs:"
+        info "    https://docs.docker.com/engine/install/"
+        exit 1
+    fi
+}
+
+# Back-compat alias for older callers.
+ohd_require_jq() { ohd_ensure_jq; }
 
 # ---------------- config IO ----------------
 ohd_init_config() {

@@ -75,10 +75,16 @@ function Test-OhdDocker {
 
 function Assert-OhdDocker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Stop-OhdDie "docker CLI not found in PATH."
+        Write-OhdErr "'docker' CLI not found in PATH."
+        Write-OhdInfo "Install Docker Desktop for Windows:"
+        Write-OhdInfo "    https://www.docker.com/products/docker-desktop/"
+        Write-OhdInfo "After install, ensure 'docker' is on your PATH and the daemon is running."
+        Stop-OhdDie  "docker CLI not found; aborting."
     }
     if (-not (Test-OhdDocker)) {
-        Stop-OhdDie "Docker daemon is not reachable. Start Docker Desktop first."
+        Write-OhdErr "Docker daemon is not reachable."
+        Write-OhdInfo "Start Docker Desktop (Windows tray) and wait until it reports 'Engine running', then retry."
+        Stop-OhdDie  "Docker daemon not reachable."
     }
 }
 

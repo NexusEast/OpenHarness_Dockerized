@@ -20,10 +20,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ORIG_ARGV=("$@")
 NO_SELF_UPDATE=0
 if [ "${OH_DEPLOYER_NO_SELF_UPDATE:-0}" = "1" ]; then NO_SELF_UPDATE=1; fi
+if [ "${OH_DEPLOYER_NO_AUTO_INSTALL:-0}" = "1" ]; then export OHD_NO_AUTO_INSTALL=1; fi
 filtered=()
 for a in "$@"; do
     case "$a" in
-        --no-self-update) NO_SELF_UPDATE=1 ;;
+        --no-self-update)  NO_SELF_UPDATE=1 ;;
+        --no-auto-install) export OHD_NO_AUTO_INSTALL=1 ;;
         *) filtered+=("$a") ;;
     esac
 done
@@ -195,6 +197,10 @@ Options:
   --yes / -y               Non-interactive: accept reasonable defaults
   --no-self-update         Skip the wrapper-repo self-update check
                            (also: env OH_DEPLOYER_NO_SELF_UPDATE=1)
+  --no-auto-install        Do not auto-install missing host dependencies
+                           (jq, docker). Default: prompt to install; pick [a]ll
+                           at any prompt to accept all installs for the session.
+                           (also: env OH_DEPLOYER_NO_AUTO_INSTALL=1)
   -h / --help              This help
 EOF
             exit 0 ;;
