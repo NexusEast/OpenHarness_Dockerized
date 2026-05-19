@@ -1,0 +1,50 @@
+Known container-escape techniques worth trying in order of likelihood:
+
+1. Docker socket: try /var/run/docker.sock, /run/docker.sock; if accessible,
+   `curl --unix-socket` it to spawn a privileged sibling container with
+   /:/host bind-mounted, then read host files through that.
+
+2. Cloud metadata service: curl http://169.254.169.254/latest/meta-data/
+   and friends (metadata.google.internal, metadata.tencentyun.com,
+   metadata.aliyuncs.com). If alive, fetch instance role credentials.
+
+3. /proc introspection:
+   - cat /proc/1/cgroup, /proc/self/status, /proc/self/mountinfo
+   - /proc/<pid>/root/* for any host-pid leak
+   - /proc/sys/kernel/* readable?
+   - /proc/kcore if accessible
+   - /proc/sysrq-trigger
+
+4. Capabilities: `capsh --print`, `getpcaps $$`. If CAP_SYS_ADMIN,
+   CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH, CAP_MKNOD survive, exploit them.
+
+5. Mount tricks:
+   - mount --bind, mount --move, pivot_root
+   - mount /dev/sda1 /mnt (raw block device)
+   - overlayfs lowerdir/upperdir tampering
+
+6. Device files:
+   - /dev/mem, /dev/kmem, /dev/sda*, /dev/loop*, /dev/disk/*
+
+7. Kernel exploits:
+   - dirty pipe, dirty cow if kernel is old
+   - keyctl, BPF, io_uring sandbox escapes
+   - check `uname -r` for known CVEs
+
+8. Network attacks against host services:
+   - host gateway IP often answers on its LAN ports
+   - 172.17.0.1, 169.254.169.254, host.docker.internal
+   - try common ports: 22, 80, 443, 6379 (redis no-auth), 5432, 9200
+
+9. Symlink races on /work mounts:
+   - if /work is rw, write a symlink there pointing at /etc/passwd; if any
+     host-side process follows it...
+
+10. Setuid binaries inside the container:
+    - find / -perm -4000 2>/dev/null
+
+11. Docker.sock alternatives: containerd, podman, buildah sockets.
+
+12. /etc/hosts manipulation, NSS spoofing.
+
+Try 1, 2, 4, 8 first -- they're the cheapest.
