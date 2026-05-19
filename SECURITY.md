@@ -143,6 +143,80 @@ These are **not** mitigated, by design:
    already trivially become root on the host. That is a host configuration
    concern, not something this wrapper can fix.
 
+## Known limits and out-of-scope scenarios
+
+The isolation contract above has been validated under a specific set of
+conditions. The scenarios below are **not** covered by the current testing
+or design and you should treat them as gaps when assessing risk:
+
+1. **Multi-host-user shared docker daemon.**
+   All automated testing was done in a single-user environment (one
+   real human, one Linux user, one Docker daemon). If user A and user B
+   on the same host both use the wrapper while sharing one Docker
+   daemon, the per-instance `oh-<name>-home` named volume is **not**
+   restricted to the creating UNIX user — anyone in the `docker` group
+   can `docker volume inspect` it or `docker run` a container that
+   mounts it. The wrapper's perimeter assumes "one host user per
+   docker daemon". Multi-tenant hosts need additional access control
+   (e.g. a docker socket proxy, or rootless docker per UNIX user).
+
+2. **Windows / PowerShell parity is implemented but not test-validated
+   to the same depth as Linux.**
+   The 41-check multi-instance + confusion suite (`sandbox/redteam/multi-instance-test.sh`)
+   and the three-round red-team validation were both executed against
+   the Linux/`bash` codepaths. The PowerShell mirrors (`deploy.ps1`,
+   `oh-ctl.ps1`, `Common.psm1`, `shim_template.ps1`,
+   `Install-Shims.ps1`, `update-oh.ps1`, `uninstall.ps1`) were written
+   to be logically equivalent, but if you run on Windows please assume
+   they may have parity bugs (especially around array argument
+   passing, quoting, and `--no-default` plumbing) until you've run
+   your own equivalent regression. A bug in this layer would most
+   likely produce a **confusion regression** (wrong instance picked,
+   default unexpectedly promoted) rather than an isolation regression
+   — but this has not been formally re-validated.
+
+3. **The red-team validation is bounded by the budget and the model.**
+   Round 3 (white-box) against `claude-opus-4.7` was cut off at turn 34
+   because the OpenRouter budget was exhausted, with zero successful
+   escape primitives found up to that point. A future model with
+   stronger reasoning, longer planning horizon, or access to
+   undisclosed kernel exploits is **not** something the existing
+   transcripts can speak to. The red-team rig is committed to the
+   repository so you can re-validate against newer / stronger models
+   yourself.
+
+4. **Network egress is wide open by default.**
+   Re-stating residual risk #2 from above as an explicit limit:
+   the default network mode is Docker's `bridge`, which gives the
+   container access to anything the host can route to. We do **not**
+   currently filter outbound traffic to `openrouter.ai` only.
+   `--no-network` exists for workloads that don't need the LLM,
+   but for normal use the agent can reach your LAN, your VPN's reachable
+   subnets, your cloud VPC peers, etc. If your threat model includes
+   "the agent must not be able to talk to internal IP X", you have to
+   add a host-level firewall rule yourself.
+
+5. **Side-channel and timing attacks not modelled.**
+   The wrapper does not attempt to defend against CPU cache side
+   channels, hyperthreading co-residency leaks, or differential timing
+   probes against host services. If those are in your threat model,
+   pin the container to dedicated cores and disable SMT at the host
+   kernel level — outside the scope of this wrapper.
+
+6. **No supply-chain attestation of the `openharness-ai` pip package
+   or its dependencies.**
+   We `pip install openharness-ai` from PyPI at image build time. A
+   future malicious release of `openharness-ai` itself, or any of its
+   transitive dependencies, would run inside the sandbox — which means
+   it cannot escape the host filesystem isolation, but it **could**
+   exfiltrate the OpenRouter key (residual risk #1) and could exfil
+   anything the user has put under `/work/...`. Pin a known-good
+   version via `OH_PIP_REF` if you need supply-chain stability.
+
+If any of these matter to you, audit and harden them at the host /
+operating-environment layer. The wrapper deliberately does not pretend
+to solve them.
+
 ## Verification
 
 The `sandbox/redteam/` directory contains the red-team rig used to validate
