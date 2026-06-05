@@ -29,7 +29,12 @@ done
 ohd_require_docker
 
 # Stop & remove all containers with our label.
-mapfile -t ctns < <(docker ps -aq --filter "label=$OHD_LABEL" 2>/dev/null || true)
+# NOTE: avoid `mapfile`/`readarray` — both are bash 4+ and macOS still
+# ships bash 3.2. The while-read idiom below works on every bash >= 3.0.
+ctns=()
+while IFS= read -r _line; do
+    [ -n "$_line" ] && ctns+=("$_line")
+done < <(docker ps -aq --filter "label=$OHD_LABEL" 2>/dev/null || true)
 if [ "${#ctns[@]}" -gt 0 ]; then
     info "Removing ${#ctns[@]} OH container(s)..."
     docker rm -f "${ctns[@]}" >/dev/null || true
@@ -39,7 +44,10 @@ else
 fi
 
 if [ "$REMOVE_VOLUMES" -eq 1 ]; then
-    mapfile -t vols < <(docker volume ls -q | grep -E '^oh-.*-home$' 2>/dev/null || true)
+    vols=()
+    while IFS= read -r _line; do
+        [ -n "$_line" ] && vols+=("$_line")
+    done < <(docker volume ls -q | grep -E '^oh-.*-home$' 2>/dev/null || true)
     if [ "${#vols[@]}" -gt 0 ]; then
         info "Removing ${#vols[@]} OH home volume(s)..."
         docker volume rm "${vols[@]}" >/dev/null || true
@@ -48,7 +56,10 @@ if [ "$REMOVE_VOLUMES" -eq 1 ]; then
 fi
 
 if [ "$REMOVE_IMAGE" -eq 1 ]; then
-    mapfile -t imgs < <(docker images -q "openharness-dockerized" 2>/dev/null | sort -u || true)
+    imgs=()
+    while IFS= read -r _line; do
+        [ -n "$_line" ] && imgs+=("$_line")
+    done < <(docker images -q "openharness-dockerized" 2>/dev/null | sort -u || true)
     if [ "${#imgs[@]}" -gt 0 ]; then
         info "Removing image(s)..."
         docker rmi -f "${imgs[@]}" >/dev/null || true

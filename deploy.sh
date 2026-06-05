@@ -271,7 +271,11 @@ declare -a MOUNT_DESCRIPTIONS=()  # for the banner + JSON metadata
 declare -a MOUNT_RECORDS=()       # parallel array of "host\ttarget\treadonly"
 
 # Detect duplicate basenames so /work/<base> doesn't collide.
-declare -A USED_BASENAMES=()
+# NOTE: macOS still ships bash 3.2 (no associative arrays), so we use
+# two parallel indexed arrays as a tiny key->value lookup table instead
+# of `declare -A`. Works on bash 3.2+ and bash 4/5.
+USED_BASENAME_KEYS=()
+USED_BASENAME_VALS=()
 
 for raw in "${MOUNTS[@]}"; do
     ro=0
@@ -288,11 +292,19 @@ for raw in "${MOUNTS[@]}"; do
     base="${base//[^A-Za-z0-9._-]/_}"
     [ -z "$base" ] && base="root"
     suffix=""
-    if [ -n "${USED_BASENAMES[$base]:-}" ]; then
-        suffix="${USED_BASENAMES[$base]}"
-        USED_BASENAMES[$base]=$((suffix + 1))
+    found_idx=-1
+    for i in "${!USED_BASENAME_KEYS[@]}"; do
+        if [ "${USED_BASENAME_KEYS[$i]}" = "$base" ]; then
+            found_idx=$i
+            break
+        fi
+    done
+    if [ "$found_idx" -ge 0 ]; then
+        suffix="${USED_BASENAME_VALS[$found_idx]}"
+        USED_BASENAME_VALS[$found_idx]=$((suffix + 1))
     else
-        USED_BASENAMES[$base]=2
+        USED_BASENAME_KEYS+=("$base")
+        USED_BASENAME_VALS+=("2")
     fi
     target="$(ohd_container_target_for "$canonical" "$suffix")"
 
